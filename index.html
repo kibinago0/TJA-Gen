@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#101216">
+    <title>TJA-Gen | 譜面ジェネレーター</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="site-header">
+        <a class="brand" href="./" aria-label="TJA-Gen ホーム">
+          <span class="brand-mark" aria-hidden="true">太</span>
+          <span>TJA<span class="brand-accent">-Gen</span></span>
+        </a>
+        <span class="privacy-note"><span class="status-dot"></span>音源は端末内で処理</span>
+      </header>
+
+      <section class="hero" aria-labelledby="page-title">
+        <p class="eyebrow">譜面づくりを、もっと自由に。</p>
+        <h1 id="page-title">音源から、<span>譜面をつくる。</span></h1>
+        <p class="hero-copy">曲と設定を選ぶだけ。ブラウザーで音の強弱を解析して、TJAファイルを生成します。</p>
+      </section>
+
+      <section class="generator-card" aria-labelledby="generator-title">
+        <div class="card-heading">
+          <div>
+            <p class="section-kicker">CHART GENERATOR</p>
+            <h2 id="generator-title">譜面の設定</h2>
+          </div>
+          <span class="step-badge">01 <span>/ 02</span></span>
+        </div>
+
+        <form id="generator-form">
+          <label class="field-label" for="audio-file">音源ファイル</label>
+          <label class="upload-area" for="audio-file" id="upload-area">
+            <input id="audio-file" name="audio-file" type="file" accept="audio/*,.wav,.mp3,.ogg,.m4a,.flac" required>
+            <span class="upload-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none">
+                <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 15.5v3A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5v-3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </span>
+            <span class="upload-text">
+              <strong id="file-name">音源を選択、またはここにドロップ</strong>
+              <span>MP3、WAV、OGG など</span>
+            </span>
+            <span class="browse-button">ファイルを選ぶ</span>
+          </label>
+
+          <div class="fields-grid">
+            <div class="field">
+              <label class="field-label" for="title">曲名</label>
+              <input id="title" name="title" type="text" maxlength="80" placeholder="曲名を入力">
+            </div>
+            <div class="field">
+              <label class="field-label" for="bpm">BPM</label>
+              <div class="input-suffix">
+                <input id="bpm" name="bpm" type="number" min="30" max="300" step="0.1" value="120" required>
+                <span>BPM</span>
+              </div>
+            </div>
+            <div class="field">
+              <label class="field-label" for="course">コース</label>
+              <select id="course" name="course">
+                <option value="Oni">おに</option>
+                <option value="Hard">むずかしい</option>
+                <option value="Normal">ふつう</option>
+                <option value="Easy">かんたん</option>
+              </select>
+            </div>
+            <div class="field">
+              <label class="field-label" for="level">★ 難易度 <output id="level-value" for="level">6</output></label>
+              <input id="level" name="level" type="range" min="1" max="10" value="6">
+              <div class="range-labels"><span>やさしい</span><span>むずかしい</span></div>
+            </div>
+          </div>
+
+          <div class="algorithm-note">
+            <span aria-hidden="true">✳</span>
+            <p><strong>自動解析について</strong>　BPMを基準に音の立ち上がりを検出します。曲に合わせたBPMの入力がおすすめです。</p>
+          </div>
+
+          <button class="generate-button" id="generate-button" type="submit">
+            <span>譜面を生成する</span>
+            <span class="button-arrow" aria-hidden="true">→</span>
+          </button>
+          <p class="error-message" id="error-message" role="alert" hidden></p>
+        </form>
+      </section>
+
+      <section class="result-card" id="result-card" aria-live="polite" hidden>
+        <div class="result-heading">
+          <div>
+            <p class="section-kicker">READY TO EXPORT</p>
+            <h2>譜面ができました</h2>
+          </div>
+          <span class="result-check" aria-hidden="true">✓</span>
+        </div>
+        <div class="result-stats">
+          <div><span>曲名</span><strong id="result-title">-</strong></div>
+          <div><span>ノーツ数</span><strong id="result-notes">-</strong></div>
+          <div><span>小節数</span><strong id="result-measures">-</strong></div>
+          <div><span>コース / ★</span><strong id="result-course">-</strong></div>
+        </div>
+        <button class="download-button" id="download-button" type="button">
+          <span aria-hidden="true">↓</span> TJAファイルをダウンロード
+        </button>
+        <p class="result-hint">出力されたTJAと音源ファイルを同じフォルダーに置いてください。</p>
+      </section>
+
+      <footer class="site-footer">
+        <span>TJA-Gen</span>
+        <span>生成された譜面は、プレイ前に内容を確認してください。</span>
+      </footer>
+    </main>
+  </body>
+</html>
