@@ -6,6 +6,7 @@
     <meta name="theme-color" content="#101216">
     <title>TJA-Gen | 譜面ジェネレーター</title>
     <link rel="stylesheet" href="styles.css">
+    <script src="trained-model.js" defer></script>
     <script src="app.js" defer></script>
   </head>
   <body>
@@ -75,11 +76,18 @@
               <input id="level" name="level" type="range" min="1" max="10" value="6">
               <div class="range-labels"><span>やさしい</span><span>むずかしい</span></div>
             </div>
+            <div class="field field-wide">
+              <label class="field-label" for="algorithm">生成方式</label>
+              <select id="algorithm" name="algorithm">
+                <option value="learned">学習モデル（実験版）</option>
+                <option value="amplitude">音量ベース（比較用）</option>
+              </select>
+            </div>
           </div>
 
           <div class="algorithm-note">
             <span aria-hidden="true">✳</span>
-            <p><strong>自動解析について</strong>　BPMを基準に音の立ち上がりを検出します。曲に合わせたBPMの入力がおすすめです。</p>
+            <p><strong>学習モデルは実験版</strong>　評価用音源でのノーツ検出F1は約0.41です。曲に合ったBPMを入力し、生成結果を必ず確認してください。</p>
           </div>
 
           <button class="generate-button" id="generate-button" type="submit">
@@ -104,6 +112,7 @@
           <div><span>小節数</span><strong id="result-measures">-</strong></div>
           <div><span>コース / ★</span><strong id="result-course">-</strong></div>
         </div>
+        <p class="result-method" id="result-method"></p>
         <button class="download-button" id="download-button" type="button">
           <span aria-hidden="true">↓</span> TJAファイルをダウンロード
         </button>
