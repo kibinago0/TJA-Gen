@@ -77,7 +77,7 @@ form.addEventListener("submit", async (event) => {
   const file = audioInput.files?.[0];
   const bpm = Number(form.elements.bpm.value);
   const targetRate = Number(form.elements["notes-per-second"].value);
-  const maxNotesPerMeasure = Number(form.elements["max-notes-per-measure"].value);
+  const measureResolution = Number(form.elements["max-notes-per-measure"].value);
   if (!file) {
     showError("譜面にする音源ファイルを選択してください。");
     return;
@@ -90,8 +90,8 @@ form.addEventListener("submit", async (event) => {
     showError("目標密度は0.1から128打/秒の範囲で入力してください。");
     return;
   }
-  if (!Number.isInteger(maxNotesPerMeasure) || maxNotesPerMeasure < 1 || maxNotesPerMeasure > 256) {
-    showError("1小節の最大音符数は1から256の整数で入力してください。");
+  if (!Number.isInteger(measureResolution) || measureResolution < 1 || measureResolution > 256) {
+    showError("1小節の分割数は1から256の整数で入力してください。");
     return;
   }
 
@@ -105,7 +105,7 @@ form.addEventListener("submit", async (event) => {
     decodedAudioBuffer = decodedAudio;
     const course = form.elements.course.value;
     const algorithm = algorithmInput.value;
-    const result = generateChart(decodedAudio, bpm, targetRate, maxNotesPerMeasure, course, algorithm);
+    const result = generateChart(decodedAudio, bpm, targetRate, measureResolution, course, algorithm);
     const title = cleanHeaderValue(form.elements.title.value.trim() || stripExtension(file.name));
     const wave = cleanHeaderValue(file.name);
     const estimatedLevel = estimatedLevelFromRate(targetRate);
@@ -161,126 +161,6 @@ function decodeAudio(file) {
     .finally(() => context.close());
 }
 
-function generateChartLegacy(audioBuffer, bpm, level, course, algorithm) {
-  if (algorithm === "learned") return generateChartWithModel(audioBuffer, bpm, level, course);
-
-  const sampleRate = audioBuffer.sampleRate;
-  const frameSize = Math.max(1, Math.round(sampleRate * 0.01));
-  const frameCount = Math.ceil(audioBuffer.length / frameSize);
-  const energy = new Float32Array(frameCount);
-  const channelData = Array.from({ length: audioBuffer.numberOfChannels }, (_, index) => audioBuffer.getChannelData(index));
-
-  for (let frame = 0; frame < frameCount; frame += 1) {
-    const start = frame * frameSize;
-    const end = Math.min(start + frameSize, audioBuffer.length);
-    let sum = 0;
-    let count = 0;
-    for (const channel of channelData) {
-      for (let sample = start; sample < end; sample += 1) {
-        const value = channel[sample];
-        sum += value * value;
-        count += 1;
-      }
-    }
-    energy[frame] = Math.sqrt(sum / Math.max(count, 1));
-  }
-
-  const onset = new Float32Array(frameCount);
-  for (let frame = 1; frame < frameCount; frame += 1) {
-    onset[frame] = Math.max(0, energy[frame] - energy[frame - 1]);
-  }
-
-  const positiveOnsets = Array.from(onset).filter((value) => value > 0.000001);
-  const scale = percentile(positiveOnsets, 0.9);
-  if (scale < 0.00001) {
-    throw new Error("音源から音の立ち上がりを検出できませんでした。音量のある音源をお試しください。");
-  }
-
-  const secondsPerBeat = 60 / bpm;
-  const slotDuration = secondsPerBeat / 4;
-  const measureDuration = secondsPerBeat * 4;
-  const measureCount = Math.max(1, Math.ceil(audioBuffer.duration / measureDuration));
-  const measures = [];
-  const threshold = 0.16 + (10 - level) * 0.022;
-  let noteCount = 0;
-  let previousWasBig = false;
-
-  for (let measureIndex = 0; measureIndex < measureCount; measureIndex += 1) {
-    let measure = "";
-    for (let slot = 0; slot < 16; slot += 1) {
-      const time = (measureIndex * 16 + slot) * slotDuration;
-      if (time >= audioBuffer.duration) {
-        measure += "0";
-        continue;
-      }
-      const center = Math.round(time / 0.01);
-      const radius = Math.max(1, Math.ceil(slotDuration * 0.32 / 0.01));
-      let peak = 0;
-      for (let frame = Math.max(0, center - radius); frame <= Math.min(frameCount - 1, center + radius); frame += 1) {
-        peak = Math.max(peak, onset[frame] / scale);
-      }
-
-      if (peak < threshold) {
-        measure += "0";
-        previousWasBig = false;
-        continue;
-      }
-      const isKat = slot % 4 === 2 || slot % 4 === 3;
-      const isBig = level >= 5 && peak >= 0.78 && !previousWasBig;
-      measure += isBig ? (isKat ? "4" : "3") : (isKat ? "2" : "1");
-      previousWasBig = isBig;
-      noteCount += 1;
-    }
-    measures.push(measure);
-  }
-
-  if (noteCount === 0) {
-    throw new Error("この設定ではノーツを検出できませんでした。BPMや難易度を調整して再生成してください。");
-  }
-  return { measures, noteCount };
-}
-
-function generateChartWithModel(audioBuffer, bpm, level, course) {
-  const model = window.TJAChartModel;
-  if (!model || model.formatVersion !== 1 || !Array.isArray(model.weights) || model.weights.length !== 10) {
-    throw new Error("学習モデルを読み込めません。trained-model.js を確認するか、音量ベース方式を選んでください。");
-  }
-  const courseIndex = modelCourseIndex[course];
-  if (courseIndex === undefined) {
-    throw new Error("選択したコースは学習モデルに対応していません。");
-  }
-
-  const envelope = createModelEnvelope(audioBuffer);
-  if (envelope.rmsScale < 0.00001) {
-    throw new Error("音源から音を検出できませんでした。音量のある音源をお試しください。");
-  }
-
-  const secondsPerBeat = 60 / bpm;
-  const measureDuration = secondsPerBeat * 4;
-  const measureCount = Math.max(1, Math.ceil(audioBuffer.duration / measureDuration));
-  const measures = [];
-  let noteCount = 0;
-  for (let measureIndex = 0; measureIndex < measureCount; measureIndex += 1) {
-    let measure = "";
-    for (let slot = 0; slot < 16; slot += 1) {
-      const audioTime = measureIndex * measureDuration + slot * measureDuration / 16;
-      if (audioTime >= audioBuffer.duration) {
-        measure += "0";
-        continue;
-      }
-      const features = makeModelFeatures(envelope, audioTime, slot, bpm, level, courseIndex);
-      const note = predictModelNote(model, features);
-      measure += String(note);
-      if (note !== 0) noteCount += 1;
-    }
-    measures.push(measure);
-  }
-  if (noteCount === 0) {
-    throw new Error("学習モデルがノーツを検出できませんでした。BPMや難易度を調整するか、音量ベース方式をお試しください。");
-  }
-  return { measures, noteCount };
-}
-
 function createModelEnvelope(audioBuffer) {
   const targetSampleRate = 11025;
   const frameSize = 110;
@@ -326,65 +206,7 @@ function createModelEnvelope(audioBuffer) {
   };
 }
 
-function makeModelFeatures(envelope, seconds, slot, bpm, level, courseIndex) {
-  const rmsValues = [-0.04, -0.02, 0, 0.02, 0.04]
-    .map((offset) => normalizedFrame(envelope.rms, seconds + offset, envelope.rmsScale));
-  const onsetValues = [-0.05, -0.02, 0, 0.02, 0.05]
-    .map((offset) => normalizedFrame(envelope.onset, seconds + offset, envelope.onsetScale));
-  const measurePhase = slot / 16 * 2 * Math.PI;
-  const beatPhase = slot % 4 / 4 * 2 * Math.PI;
-  const features = [
-    rmsValues[1],
-    rmsValues[2],
-    rmsValues[3],
-    Math.max(...rmsValues),
-    rmsValues.reduce((sum, value) => sum + value, 0) / rmsValues.length,
-    onsetValues[1],
-    onsetValues[2],
-    onsetValues[3],
-    Math.max(...onsetValues),
-    onsetValues.reduce((sum, value) => sum + value, 0) / onsetValues.length,
-    Math.sin(measurePhase),
-    Math.cos(measurePhase),
-    Math.sin(beatPhase),
-    Math.cos(beatPhase),
-    Math.min(1, bpm / 400),
-    Math.min(1, level / 10)
-  ];
-  for (let index = 0; index < 5; index += 1) {
-    features.push(index === courseIndex ? 1 : 0);
-  }
-  return features;
-}
-
-function normalizedFrame(frames, seconds, scale) {
-  if (!frames.length || !scale) return 0;
-  const frameSeconds = 110 / 11025;
-  const index = Math.max(0, Math.min(frames.length - 1, Math.round(seconds / frameSeconds)));
-  return Math.min(1, frames[index] / scale);
-}
-
-function predictModelNote(model, features) {
-  let bestNote = 0;
-  let bestScore = -Infinity;
-  for (let note = 0; note <= 4; note += 1) {
-    const weights = model.weights[note];
-    if (!Array.isArray(weights) || weights.length !== features.length + 1) {
-      throw new Error("学習モデルの重みの形式が正しくありません。");
-    }
-    let score = weights[features.length];
-    for (let index = 0; index < features.length; index += 1) {
-      score += weights[index] * features[index];
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      bestNote = note;
-    }
-  }
-  return bestNote;
-}
-
-function generateChart(audioBuffer, bpm, targetRate, maxNotesPerMeasure, course, algorithm) {
+function generateChart(audioBuffer, bpm, targetRate, measureResolution, course, algorithm) {
   const envelope = createModelEnvelope(audioBuffer);
   if (envelope.rmsScale < 0.00001) {
     throw new Error("音源から音を検出できませんでした。音量のある音源をお試しください。");
@@ -406,20 +228,20 @@ function generateChart(audioBuffer, bpm, targetRate, maxNotesPerMeasure, course,
   for (let measureIndex = 0; measureIndex < measureCount; measureIndex += 1) {
     const measureStart = measureIndex * measureDuration;
     const measureLength = Math.min(measureDuration, audioBuffer.duration - measureStart);
-    const targetCount = Math.min(maxNotesPerMeasure, Math.round(targetRate * measureLength));
+    const targetCount = Math.min(measureResolution, Math.round(targetRate * measureLength));
     const candidates = [];
-    for (let slot = 0; slot < 256; slot += 1) {
-      const time = measureStart + measureDuration * slot / 256;
+    for (let slot = 0; slot < measureResolution; slot += 1) {
+      const time = measureStart + measureDuration * slot / measureResolution;
       if (time >= audioBuffer.duration) continue;
       const candidate = algorithm === "learned"
-        ? scoreWithModel(model, envelope, time, slot, bpm, level, courseIndex)
-        : scoreByAmplitude(envelope, time, slot);
+        ? scoreWithModel(model, envelope, time, slot, measureResolution, bpm, level, courseIndex)
+        : scoreByAmplitude(envelope, time, slot, measureResolution);
       candidates.push({ ...candidate, slot });
     }
     candidates.sort((left, right) => right.score - left.score || left.slot - right.slot);
     const selected = new Map(candidates.slice(0, targetCount).map((candidate) => [candidate.slot, candidate.note]));
     let row = "";
-    for (let slot = 0; slot < 256; slot += 1) {
+    for (let slot = 0; slot < measureResolution; slot += 1) {
       row += String(selected.get(slot) ?? 0);
     }
     noteCount += selected.size;
@@ -484,21 +306,21 @@ function estimateBpm(onset) {
   };
 }
 
-function scoreByAmplitude(envelope, seconds, slot) {
+function scoreByAmplitude(envelope, seconds, slot, measureResolution) {
   const center = Math.round(seconds / envelope.frameSeconds);
   const radius = Math.max(1, Math.round(0.035 / envelope.frameSeconds));
   let peak = 0;
   for (let frame = Math.max(0, center - radius); frame <= Math.min(envelope.onset.length - 1, center + radius); frame += 1) {
     peak = Math.max(peak, envelope.onset[frame] / Math.max(envelope.onsetScale, 1e-8));
   }
-  const beatFraction = (slot / 256 * 4) % 1;
+  const beatFraction = (slot / measureResolution * 4) % 1;
   const isKat = beatFraction >= 0.5;
   const isBig = peak >= 0.75;
   return { score: peak, note: isBig ? (isKat ? 4 : 3) : (isKat ? 2 : 1) };
 }
 
-function scoreWithModel(model, envelope, seconds, slot, bpm, level, courseIndex) {
-  const features = makeHighResolutionFeatures(envelope, seconds, slot, bpm, level, courseIndex);
+function scoreWithModel(model, envelope, seconds, slot, measureResolution, bpm, level, courseIndex) {
+  const features = makeHighResolutionFeatures(envelope, seconds, slot, measureResolution, bpm, level, courseIndex);
   const scores = [];
   for (let note = 0; note <= 4; note += 1) {
     const weights = model.weights[note];
@@ -521,13 +343,13 @@ function scoreWithModel(model, envelope, seconds, slot, bpm, level, courseIndex)
   return { score: logSumExpNotes - scores[0], note: bestNote };
 }
 
-function makeHighResolutionFeatures(envelope, seconds, slot, bpm, level, courseIndex) {
+function makeHighResolutionFeatures(envelope, seconds, slot, measureResolution, bpm, level, courseIndex) {
   const rmsValues = [-0.04, -0.02, 0, 0.02, 0.04]
     .map((offset) => normalizedFrame(envelope.rms, seconds + offset, envelope.rmsScale, envelope.frameSeconds));
   const onsetValues = [-0.05, -0.02, 0, 0.02, 0.05]
     .map((offset) => normalizedFrame(envelope.onset, seconds + offset, envelope.onsetScale, envelope.frameSeconds));
-  const measurePhase = slot / 256 * 2 * Math.PI;
-  const beatPosition = slot / 256 * 4;
+  const measurePhase = slot / measureResolution * 2 * Math.PI;
+  const beatPosition = slot / measureResolution * 4;
   const beatPhase = (beatPosition - Math.floor(beatPosition)) * 2 * Math.PI;
   const features = [
     rmsValues[1], rmsValues[2], rmsValues[3],

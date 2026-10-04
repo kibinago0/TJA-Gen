@@ -80,11 +80,12 @@
               </div>
             </div>
             <div class="field">
-              <label class="field-label" for="max-notes-per-measure">1小節の最大音符数</label>
+              <label class="field-label" for="max-notes-per-measure">1小節の分割数</label>
               <div class="input-suffix">
                 <input id="max-notes-per-measure" name="max-notes-per-measure" type="number" min="1" max="256" step="1" value="256" required>
-                <span>音符</span>
+                <span>枠</span>
               </div>
+              <p class="field-status">休符を含む配置枠の数です。256なら256分音符まで配置できます。</p>
             </div>
             <div class="field field-wide">
               <label class="field-label" for="algorithm">生成方式</label>
@@ -97,7 +98,7 @@
 
           <div class="algorithm-note">
             <span aria-hidden="true">✳</span>
-            <p><strong>生成密度を指定</strong>　目標の打/秒に合わせて音符数を調整します。BPMと最大音符数で出せる範囲を超える場合は自動で上限に収めます。</p>
+            <p><strong>密度と分割数を指定</strong>　分割数は休符を含む配置枠の数です。その枠の中に目標の打/秒に合わせて音符を配置します。</p>
           </div>
 
           <button class="generate-button" id="generate-button" type="submit">
