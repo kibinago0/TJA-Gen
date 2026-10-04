@@ -5,23 +5,48 @@ const fileName = document.querySelector("#file-name");
 const generateButton = document.querySelector("#generate-button");
 const errorMessage = document.querySelector("#error-message");
 const resultCard = document.querySelector("#result-card");
-const levelInput = document.querySelector("#level");
-const levelValue = document.querySelector("#level-value");
 const algorithmInput = document.querySelector("#algorithm");
+const bpmInput = document.querySelector("#bpm");
+const bpmStatus = document.querySelector("#bpm-status");
 
 let generatedTja = "";
 let generatedFileName = "chart.tja";
+let decodedFile = null;
+let decodedAudioBuffer = null;
+let audioLoadId = 0;
 const modelCourseIndex = { Easy: 0, Normal: 1, Hard: 2, Oni: 3, Edit: 4 };
 
-levelInput.addEventListener("input", () => {
-  levelValue.value = levelInput.value;
+bpmInput.addEventListener("input", () => {
+  if (decodedFile) bpmStatus.textContent = "手動設定したBPMを使用します。";
 });
 
-audioInput.addEventListener("change", () => {
+audioInput.addEventListener("change", async () => {
   const file = audioInput.files?.[0];
   fileName.textContent = file?.name ?? "音源を選択、またはここにドロップ";
   resultCard.hidden = true;
   errorMessage.hidden = true;
+  decodedFile = null;
+  decodedAudioBuffer = null;
+  bpmInput.value = "";
+  const loadId = ++audioLoadId;
+  if (!file) {
+    bpmStatus.textContent = "音源を選ぶとBPMを推定します。";
+    return;
+  }
+  bpmStatus.textContent = "音源を解析してBPMを検出中…";
+  try {
+    const audioBuffer = await decodeAudio(file);
+    if (loadId !== audioLoadId) return;
+    decodedFile = file;
+    decodedAudioBuffer = audioBuffer;
+    const estimate = estimateBpm(createModelEnvelope(audioBuffer).onset);
+    bpmInput.value = estimate.bpm.toFixed(1);
+    bpmStatus.textContent = `自動推定: ${estimate.bpm.toFixed(1)} BPM（必要なら修正できます）`;
+  } catch (error) {
+    if (loadId !== audioLoadId) return;
+    bpmStatus.textContent = "BPMを自動検出できませんでした。BPMを手入力してください。";
+    showError(error instanceof Error ? error.message : "音源を読み込めませんでした。");
+  }
 });
 
 uploadArea.addEventListener("dragover", (event) => {
@@ -51,36 +76,51 @@ form.addEventListener("submit", async (event) => {
 
   const file = audioInput.files?.[0];
   const bpm = Number(form.elements.bpm.value);
-  const level = Number(form.elements.level.value);
+  const targetRate = Number(form.elements["notes-per-second"].value);
+  const maxNotesPerMeasure = Number(form.elements["max-notes-per-measure"].value);
   if (!file) {
     showError("譜面にする音源ファイルを選択してください。");
     return;
   }
   if (!Number.isFinite(bpm) || bpm < 30 || bpm > 300) {
-    showError("BPMは30から300の範囲で入力してください。");
+    showError("BPMを30から300の範囲で入力してください。自動検出できない場合は手入力してください。");
+    return;
+  }
+  if (!Number.isFinite(targetRate) || targetRate < 0.1 || targetRate > 128) {
+    showError("目標密度は0.1から128打/秒の範囲で入力してください。");
+    return;
+  }
+  if (!Number.isInteger(maxNotesPerMeasure) || maxNotesPerMeasure < 1 || maxNotesPerMeasure > 256) {
+    showError("1小節の最大音符数は1から256の整数で入力してください。");
     return;
   }
 
   generateButton.disabled = true;
-  generateButton.querySelector("span").textContent = "音源を解析中…";
+  generateButton.querySelector("span").textContent = "譜面を生成中…";
   try {
-    const decodedAudio = await decodeAudio(file);
+    const decodedAudio = decodedFile === file && decodedAudioBuffer
+      ? decodedAudioBuffer
+      : await decodeAudio(file);
+    decodedFile = file;
+    decodedAudioBuffer = decodedAudio;
     const course = form.elements.course.value;
     const algorithm = algorithmInput.value;
-    const result = generateChart(decodedAudio, bpm, level, course, algorithm);
+    const result = generateChart(decodedAudio, bpm, targetRate, maxNotesPerMeasure, course, algorithm);
     const title = cleanHeaderValue(form.elements.title.value.trim() || stripExtension(file.name));
     const wave = cleanHeaderValue(file.name);
-    const tja = buildTja({ title, wave, bpm, course, level, result });
+    const estimatedLevel = estimatedLevelFromRate(targetRate);
+    const tja = buildTja({ title, wave, bpm, course, level: estimatedLevel, result });
 
     generatedTja = tja;
     generatedFileName = `${safeFileName(title)}.tja`;
     document.querySelector("#result-title").textContent = title;
     document.querySelector("#result-notes").textContent = result.noteCount.toLocaleString("ja-JP");
     document.querySelector("#result-measures").textContent = result.measures.length.toLocaleString("ja-JP");
-    document.querySelector("#result-course").textContent = `${courseLabel(course)} / ★${level}`;
+    document.querySelector("#result-density").textContent = `${result.actualRate.toFixed(1)} 打/秒`;
+    document.querySelector("#result-course").textContent = `${courseLabel(course)} / ★${estimatedLevel}`;
     document.querySelector("#result-method").textContent = algorithm === "learned"
-      ? "学習モデルによる生成（実験版）"
-      : "音量ベースによる生成";
+      ? `学習モデルによる生成（実験版・目標 ${targetRate} 打/秒）`
+      : `音量ベースによる生成（目標 ${targetRate} 打/秒）`;
     resultCard.hidden = false;
   } catch (error) {
     showError(error instanceof Error ? error.message : "音源を解析できませんでした。別の音源をお試しください。");
@@ -121,7 +161,7 @@ function decodeAudio(file) {
     .finally(() => context.close());
 }
 
-function generateChart(audioBuffer, bpm, level, course, algorithm) {
+function generateChartLegacy(audioBuffer, bpm, level, course, algorithm) {
   if (algorithm === "learned") return generateChartWithModel(audioBuffer, bpm, level, course);
 
   const sampleRate = audioBuffer.sampleRate;
@@ -277,6 +317,8 @@ function createModelEnvelope(audioBuffer) {
     onset[frame] = Math.max(0, rms[frame] - rms[frame - 1]);
   }
   return {
+    duration: audioBuffer.duration,
+    frameSeconds: frameSize / targetSampleRate,
     rms,
     onset,
     rmsScale: percentile(rms, 0.95),
@@ -340,6 +382,176 @@ function predictModelNote(model, features) {
     }
   }
   return bestNote;
+}
+
+function generateChart(audioBuffer, bpm, targetRate, maxNotesPerMeasure, course, algorithm) {
+  const envelope = createModelEnvelope(audioBuffer);
+  if (envelope.rmsScale < 0.00001) {
+    throw new Error("音源から音を検出できませんでした。音量のある音源をお試しください。");
+  }
+  const level = estimatedLevelFromRate(targetRate);
+  const model = algorithm === "learned" ? window.TJAChartModel : null;
+  if (algorithm === "learned" && (!model || model.formatVersion !== 1 || model.weights?.length !== 10)) {
+    throw new Error("学習モデルを読み込めません。trained-model.js を確認するか、音量ベース方式を選んでください。");
+  }
+  const courseIndex = modelCourseIndex[course];
+  if (algorithm === "learned" && courseIndex === undefined) {
+    throw new Error("選択したコースは学習モデルに対応していません。");
+  }
+
+  const measureDuration = 240 / bpm;
+  const measureCount = Math.max(1, Math.ceil(audioBuffer.duration / measureDuration));
+  const measures = [];
+  let noteCount = 0;
+  for (let measureIndex = 0; measureIndex < measureCount; measureIndex += 1) {
+    const measureStart = measureIndex * measureDuration;
+    const measureLength = Math.min(measureDuration, audioBuffer.duration - measureStart);
+    const targetCount = Math.min(maxNotesPerMeasure, Math.round(targetRate * measureLength));
+    const candidates = [];
+    for (let slot = 0; slot < 256; slot += 1) {
+      const time = measureStart + measureDuration * slot / 256;
+      if (time >= audioBuffer.duration) continue;
+      const candidate = algorithm === "learned"
+        ? scoreWithModel(model, envelope, time, slot, bpm, level, courseIndex)
+        : scoreByAmplitude(envelope, time, slot);
+      candidates.push({ ...candidate, slot });
+    }
+    candidates.sort((left, right) => right.score - left.score || left.slot - right.slot);
+    const selected = new Map(candidates.slice(0, targetCount).map((candidate) => [candidate.slot, candidate.note]));
+    let row = "";
+    for (let slot = 0; slot < 256; slot += 1) {
+      row += String(selected.get(slot) ?? 0);
+    }
+    noteCount += selected.size;
+    measures.push(row);
+  }
+  if (noteCount === 0) {
+    throw new Error("目標密度が低すぎるため音符がありません。打/秒を上げてください。");
+  }
+  return { measures, noteCount, actualRate: noteCount / audioBuffer.duration };
+}
+
+function estimateBpm(onset) {
+  const frameSeconds = 110 / 11025;
+  const halfWindow = 50;
+  const prefix = new Float64Array(onset.length + 1);
+  for (let index = 0; index < onset.length; index += 1) {
+    prefix[index + 1] = prefix[index] + onset[index];
+  }
+  const centered = new Float64Array(onset.length);
+  for (let index = 0; index < onset.length; index += 1) {
+    const start = Math.max(0, index - halfWindow);
+    const end = Math.min(onset.length, index + halfWindow + 1);
+    const localMean = (prefix[end] - prefix[start]) / (end - start);
+    centered[index] = Math.max(0, onset[index] - localMean);
+  }
+
+  const maxLag = Math.min(Math.floor(60 / (30 * frameSeconds)), Math.floor(onset.length / 3));
+  const minLag = Math.max(2, Math.floor(60 / (300 * frameSeconds)));
+  const correlations = new Float32Array(maxLag + 1);
+  for (let lag = minLag; lag <= maxLag; lag += 1) {
+    let dot = 0;
+    let leftEnergy = 0;
+    let rightEnergy = 0;
+    for (let index = 0; index + lag < centered.length; index += 1) {
+      const left = centered[index];
+      const right = centered[index + lag];
+      dot += left * right;
+      leftEnergy += left * left;
+      rightEnergy += right * right;
+    }
+    correlations[lag] = dot / Math.sqrt(Math.max(1e-12, leftEnergy * rightEnergy));
+  }
+
+  let bestLag = 0;
+  let bestScore = -Infinity;
+  for (let lag = minLag; lag <= maxLag; lag += 1) {
+    const score = correlations[lag]
+      + 0.35 * (correlations[lag * 2] ?? 0)
+      + 0.15 * (correlations[lag * 3] ?? 0)
+      + 0.2 * (correlations[Math.round(lag / 2)] ?? 0);
+    if (score > bestScore) {
+      bestScore = score;
+      bestLag = lag;
+    }
+  }
+  if (!bestLag || bestScore < 0.015) {
+    throw new Error("BPMを自動検出できませんでした。BPMを手入力してください。");
+  }
+  return {
+    bpm: Math.round(60 / (bestLag * frameSeconds) * 10) / 10,
+    confidence: bestScore
+  };
+}
+
+function scoreByAmplitude(envelope, seconds, slot) {
+  const center = Math.round(seconds / envelope.frameSeconds);
+  const radius = Math.max(1, Math.round(0.035 / envelope.frameSeconds));
+  let peak = 0;
+  for (let frame = Math.max(0, center - radius); frame <= Math.min(envelope.onset.length - 1, center + radius); frame += 1) {
+    peak = Math.max(peak, envelope.onset[frame] / Math.max(envelope.onsetScale, 1e-8));
+  }
+  const beatFraction = (slot / 256 * 4) % 1;
+  const isKat = beatFraction >= 0.5;
+  const isBig = peak >= 0.75;
+  return { score: peak, note: isBig ? (isKat ? 4 : 3) : (isKat ? 2 : 1) };
+}
+
+function scoreWithModel(model, envelope, seconds, slot, bpm, level, courseIndex) {
+  const features = makeHighResolutionFeatures(envelope, seconds, slot, bpm, level, courseIndex);
+  const scores = [];
+  for (let note = 0; note <= 4; note += 1) {
+    const weights = model.weights[note];
+    if (!Array.isArray(weights) || weights.length !== features.length + 1) {
+      throw new Error("学習モデルの重みの形式が正しくありません。");
+    }
+    let score = weights[features.length];
+    for (let index = 0; index < features.length; index += 1) {
+      score += weights[index] * features[index];
+    }
+    scores.push(score);
+  }
+  let bestNote = 1;
+  for (let note = 2; note <= 4; note += 1) {
+    if (scores[note] > scores[bestNote]) bestNote = note;
+  }
+  const maxNoteScore = Math.max(...scores.slice(1));
+  const logSumExpNotes = maxNoteScore
+    + Math.log(scores.slice(1).reduce((sum, score) => sum + Math.exp(score - maxNoteScore), 0));
+  return { score: logSumExpNotes - scores[0], note: bestNote };
+}
+
+function makeHighResolutionFeatures(envelope, seconds, slot, bpm, level, courseIndex) {
+  const rmsValues = [-0.04, -0.02, 0, 0.02, 0.04]
+    .map((offset) => normalizedFrame(envelope.rms, seconds + offset, envelope.rmsScale, envelope.frameSeconds));
+  const onsetValues = [-0.05, -0.02, 0, 0.02, 0.05]
+    .map((offset) => normalizedFrame(envelope.onset, seconds + offset, envelope.onsetScale, envelope.frameSeconds));
+  const measurePhase = slot / 256 * 2 * Math.PI;
+  const beatPosition = slot / 256 * 4;
+  const beatPhase = (beatPosition - Math.floor(beatPosition)) * 2 * Math.PI;
+  const features = [
+    rmsValues[1], rmsValues[2], rmsValues[3],
+    Math.max(...rmsValues),
+    rmsValues.reduce((sum, value) => sum + value, 0) / rmsValues.length,
+    onsetValues[1], onsetValues[2], onsetValues[3],
+    Math.max(...onsetValues),
+    onsetValues.reduce((sum, value) => sum + value, 0) / onsetValues.length,
+    Math.sin(measurePhase), Math.cos(measurePhase),
+    Math.sin(beatPhase), Math.cos(beatPhase),
+    Math.min(1, bpm / 400), Math.min(1, level / 10)
+  ];
+  for (let index = 0; index < 5; index += 1) features.push(index === courseIndex ? 1 : 0);
+  return features;
+}
+
+function normalizedFrame(frames, seconds, scale, frameSeconds) {
+  if (!frames.length || !scale) return 0;
+  const index = Math.max(0, Math.min(frames.length - 1, Math.round(seconds / frameSeconds)));
+  return Math.min(1, frames[index] / scale);
+}
+
+function estimatedLevelFromRate(rate) {
+  return Math.max(1, Math.min(10, Math.round(rate * 1.5)));
 }
 
 function percentile(values, fraction) {

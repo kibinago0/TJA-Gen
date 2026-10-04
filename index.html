@@ -56,11 +56,12 @@
               <input id="title" name="title" type="text" maxlength="80" placeholder="曲名を入力">
             </div>
             <div class="field">
-              <label class="field-label" for="bpm">BPM</label>
+              <label class="field-label" for="bpm">BPM <span class="field-hint">自動検出・修正できます</span></label>
               <div class="input-suffix">
-                <input id="bpm" name="bpm" type="number" min="30" max="300" step="0.1" value="120" required>
+                <input id="bpm" name="bpm" type="number" min="30" max="300" step="0.1" placeholder="音源を選択" required>
                 <span>BPM</span>
               </div>
+              <p class="field-status" id="bpm-status" aria-live="polite">音源を選ぶとBPMを推定します。</p>
             </div>
             <div class="field">
               <label class="field-label" for="course">コース</label>
@@ -72,9 +73,18 @@
               </select>
             </div>
             <div class="field">
-              <label class="field-label" for="level">★ 難易度 <output id="level-value" for="level">6</output></label>
-              <input id="level" name="level" type="range" min="1" max="10" value="6">
-              <div class="range-labels"><span>やさしい</span><span>むずかしい</span></div>
+              <label class="field-label" for="notes-per-second">目標密度</label>
+              <div class="input-suffix">
+                <input id="notes-per-second" name="notes-per-second" type="number" min="0.1" max="128" step="0.1" value="5" required>
+                <span>打/秒</span>
+              </div>
+            </div>
+            <div class="field">
+              <label class="field-label" for="max-notes-per-measure">1小節の最大音符数</label>
+              <div class="input-suffix">
+                <input id="max-notes-per-measure" name="max-notes-per-measure" type="number" min="1" max="256" step="1" value="256" required>
+                <span>音符</span>
+              </div>
             </div>
             <div class="field field-wide">
               <label class="field-label" for="algorithm">生成方式</label>
@@ -87,7 +97,7 @@
 
           <div class="algorithm-note">
             <span aria-hidden="true">✳</span>
-            <p><strong>学習モデルは実験版</strong>　評価用音源でのノーツ検出F1は約0.41です。曲に合ったBPMを入力し、生成結果を必ず確認してください。</p>
+            <p><strong>生成密度を指定</strong>　目標の打/秒に合わせて音符数を調整します。BPMと最大音符数で出せる範囲を超える場合は自動で上限に収めます。</p>
           </div>
 
           <button class="generate-button" id="generate-button" type="submit">
@@ -110,7 +120,8 @@
           <div><span>曲名</span><strong id="result-title">-</strong></div>
           <div><span>ノーツ数</span><strong id="result-notes">-</strong></div>
           <div><span>小節数</span><strong id="result-measures">-</strong></div>
-          <div><span>コース / ★</span><strong id="result-course">-</strong></div>
+          <div><span>実際の密度</span><strong id="result-density">-</strong></div>
+          <div><span>コース / ★目安</span><strong id="result-course">-</strong></div>
         </div>
         <p class="result-method" id="result-method"></p>
         <button class="download-button" id="download-button" type="button">

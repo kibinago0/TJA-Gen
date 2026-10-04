@@ -1,16 +1,18 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { createReadStream } from "node:fs";
-import { access, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { once } from "node:events";
+import { finished } from "node:stream/promises";
+import { access, mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { TextDecoder } from "node:util";
+import { fileURLToPath } from "node:url";
 
 const SAMPLE_RATE = 11025;
 const FRAME_SAMPLES = 110;
 const FRAME_SECONDS = FRAME_SAMPLES / SAMPLE_RATE;
 const CLASS_COUNT = 10;
-let updateCount = 0;
 const FEATURE_NAMES = [
   "rms_before",
   "rms_center",
@@ -51,6 +53,8 @@ if (options.help) {
 
 const root = path.resolve(options.dataDir);
 const outputDir = path.join(root, ".tja-gen-training");
+const trainingDataPath = path.join(outputDir, "training-samples.bin");
+const validationDataPath = path.join(outputDir, "validation-samples.bin");
 const summary = {
   tjaFiles: 0,
   charts: 0,
@@ -80,6 +84,7 @@ try {
   }
 
   const classCounts = new Array(CLASS_COUNT).fill(0);
+  const densityByCourse = new Map();
   for (const group of hashedGroups) {
     for (const chart of group.charts) {
       const prepared = prepareChart(chart);
@@ -87,6 +92,14 @@ try {
         countUnsupported(summary, prepared.reason);
         continue;
       }
+      const totalDuration = prepared.measures.reduce((sum, measure) => sum + measure.duration, 0);
+      const totalNotes = prepared.measures.reduce(
+        (sum, measure) => sum + measure.labels.filter((label) => label !== 0).length,
+        0
+      );
+      const courseName = ["Easy", "Normal", "Hard", "Oni", "Edit"][chart.courseIndex];
+      if (!densityByCourse.has(courseName)) densityByCourse.set(courseName, []);
+      densityByCourse.get(courseName).push(totalNotes / Math.max(totalDuration, 1e-8));
       if (group.validation) continue;
       for (const measure of prepared.measures) {
         for (const label of measure.labels) classCounts[label] += 1;
@@ -94,54 +107,53 @@ try {
     }
   }
 
-  const classWeights = makeClassWeights(classCounts);
-  const model = createModel(FEATURE_NAMES.length);
-  const random = seededRandom(0x544a4147);
+  await mkdir(outputDir, { recursive: true });
+  const trainingStream = createWriteStream(trainingDataPath);
+  const validationStream = createWriteStream(validationDataPath);
   let trainedCharts = 0;
-  let trainedSlots = 0;
-  let processed = 0;
-
-  for (const group of trainingGroups) {
-    const envelope = await decodeAudio(group.audioPath);
-    for (const chart of group.charts) {
-      const prepared = prepareChart(chart);
-      if (!prepared.ok) continue;
-      const chartExamples = makeTrainingExamples(prepared, envelope, group.hash, trainedCharts);
-      if (chartExamples.length) {
-        shuffle(chartExamples, random);
-        for (const example of chartExamples) {
-          trainExample(model, example.features, example.label, classWeights);
-        }
-        trainedSlots += chartExamples.length;
-        trainedCharts += 1;
-      }
-    }
-    processed += 1;
-    printProgress("学習", processed, trainingGroups.length);
-  }
-  console.log();
-
+  let trainingExamples = 0;
   let validationCharts = 0;
   let validationSlots = 0;
-  const confusion = Array.from({ length: CLASS_COUNT }, () => new Array(CLASS_COUNT).fill(0));
-  for (const group of validationGroups) {
-    const envelope = await decodeAudio(group.audioPath);
-    for (const chart of group.charts) {
-      const prepared = prepareChart(chart);
-      if (!prepared.ok) continue;
-      validationCharts += 1;
-      for (const sample of chartSamples(prepared, envelope)) {
-        const prediction = predict(model, sample.features);
-        confusion[sample.label][prediction] += 1;
-        validationSlots += 1;
+  let processed = 0;
+  try {
+    for (const group of hashedGroups) {
+      const envelope = await decodeAudio(group.audioPath);
+      let groupChartIndex = 0;
+      for (const chart of group.charts) {
+        const prepared = prepareChart(chart);
+        if (prepared.ok) {
+          if (group.validation) {
+            const examples = Array.from(chartSamples(prepared, envelope));
+            if (examples.length) {
+              await writeExamples(validationStream, examples);
+              validationCharts += 1;
+              validationSlots += examples.length;
+            }
+          } else {
+            const examples = makeTrainingExamples(prepared, envelope, group.hash, groupChartIndex);
+            if (examples.length) {
+              await writeExamples(trainingStream, examples);
+              trainingExamples += examples.length;
+              trainedCharts += 1;
+            }
+          }
+        }
+        groupChartIndex += 1;
+      }
+      processed += 1;
+      if (processed % 25 === 0 || processed === hashedGroups.length) {
+        printProgress("音源解析", processed, hashedGroups.length);
       }
     }
-    processed += 1;
-    printProgress("評価", processed - trainingGroups.length, validationGroups.length);
+    await Promise.all([endStream(trainingStream), endStream(validationStream)]);
+  } catch (error) {
+    trainingStream.destroy();
+    validationStream.destroy();
+    throw error;
   }
   console.log();
 
-  if (!trainedSlots || !validationSlots) {
+  if (!trainingExamples || !validationSlots) {
     throw new Error("学習または評価に使えるノーツがありません。譜面の形式と対応音源を確認してください。");
   }
 
@@ -153,23 +165,36 @@ try {
   summary.validationAudioGroups = validationGroups.length;
   summary.trainingCharts = trainedCharts;
   summary.validationCharts = validationCharts;
-  summary.trainingExamples = trainedSlots;
+  summary.trainingExamplesPerEpoch = trainingExamples;
   summary.validationSlots = validationSlots;
   summary.noteClassCounts = classCounts;
-  summary.metrics = calculateMetrics(confusion);
-  summary.model = "multiclass logistic regression (one local pass; sampled empty slots)";
+  summary.densityByCourse = Object.fromEntries(
+    [...densityByCourse.entries()].sort(([left], [right]) => left.localeCompare(right))
+      .map(([course, values]) => [course, summarize(values)])
+  );
+  summary.trainingEpochs = options.epochs;
+  summary.model = `numpy minibatch multiclass logistic regression (${options.epochs} epochs; sampled empty slots)`;
   summary.audioFeatures = "10 ms mono RMS and positive RMS differences";
   summary.split = "SHA-256 audio-content groups; deterministic 20% holdout";
   summary.offsetRule = "audio time = chart time - TJA OFFSET";
 
-  await mkdir(outputDir, { recursive: true });
-  await writeFile(path.join(outputDir, "model.json"), JSON.stringify({
-    formatVersion: 1,
-    classes: CLASS_COUNT,
-    features: FEATURE_NAMES,
-    weights: model.map((row) => Array.from(row))
-  }, null, 2), "utf8");
+  const modelPath = path.join(outputDir, "model.json");
+  const metricsPath = path.join(outputDir, "metrics.json");
+  await runPythonTrainer({
+    python: options.python,
+    script: path.join(path.dirname(fileURLToPath(import.meta.url)), "fit-chart-model.py"),
+    trainPath: trainingDataPath,
+    validationPath: validationDataPath,
+    modelPath,
+    metricsPath,
+    epochs: options.epochs,
+    featureCount: FEATURE_NAMES.length,
+    classCount: CLASS_COUNT,
+    classCounts
+  });
+  summary.metrics = JSON.parse(await readFile(metricsPath, "utf8"));
   await writeFile(path.join(outputDir, "report.json"), JSON.stringify(summary, null, 2), "utf8");
+  await Promise.all([unlink(trainingDataPath), unlink(validationDataPath), unlink(metricsPath)]);
 
   console.log("完了しました。");
   console.log(`TJAファイル: ${summary.tjaFiles}`);
@@ -185,6 +210,53 @@ try {
     console.error("除外理由（チャート数）:", JSON.stringify(summary.unsupported));
   }
   process.exitCode = 1;
+}
+
+async function writeExamples(stream, examples) {
+  const recordSize = FEATURE_NAMES.length * 4 + 1;
+  const buffer = Buffer.allocUnsafe(examples.length * recordSize);
+  let offset = 0;
+  for (const example of examples) {
+    for (const feature of example.features) {
+      buffer.writeFloatLE(feature, offset);
+      offset += 4;
+    }
+    buffer.writeUInt8(example.label, offset);
+    offset += 1;
+  }
+  if (!stream.write(buffer)) await once(stream, "drain");
+}
+
+async function endStream(stream) {
+  stream.end();
+  await finished(stream);
+}
+
+function runPythonTrainer(options) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      options.script,
+      "--train", options.trainPath,
+      "--validation", options.validationPath,
+      "--model", options.modelPath,
+      "--metrics", options.metricsPath,
+      "--epochs", String(options.epochs),
+      "--feature-count", String(options.featureCount),
+      "--class-count", String(options.classCount),
+      "--class-counts", options.classCounts.join(",")
+    ];
+    const trainer = spawn(options.python, args, {
+      windowsHide: true,
+      env: { ...process.env, PYTHONIOENCODING: "utf-8" }
+    });
+    trainer.stdout.on("data", (chunk) => process.stdout.write(chunk));
+    trainer.stderr.on("data", (chunk) => process.stderr.write(chunk));
+    trainer.on("error", (error) => reject(new Error(`Python学習処理を起動できません: ${error.message}`)));
+    trainer.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`Python学習処理が終了コード ${code} で失敗しました。Python 3 と NumPy が必要です。`));
+    });
+  });
 }
 
 async function loadChartGroups(dataDir, report) {
@@ -461,19 +533,29 @@ function makeTrainingExamples(prepared, envelope, groupHash, chartIndex) {
   }
   const negativeCount = slotCount - positiveCount;
   if (!positiveCount) return [];
-  const negativeProbability = Math.min(1, positiveCount * 2 / Math.max(1, negativeCount));
+  const negativeProbability = Math.min(1, positiveCount * 0.5 / Math.max(1, negativeCount));
   const result = [];
   let slotIndex = 0;
-  for (const sample of chartSamples(prepared, envelope)) {
-    if (sample.label === 0) {
-      const key = `${groupHash}:${chartIndex}:${slotIndex}`;
-      if (hashFraction(key) >= negativeProbability) {
-        slotIndex += 1;
-        continue;
+  for (const measure of prepared.measures) {
+    for (let slot = 0; slot < measure.stepCount; slot += 1) {
+      const label = measure.labels[slot];
+      if (label === 0) {
+        const key = `${groupHash}:${chartIndex}:${slotIndex}`;
+        if (hashFraction(key) >= negativeProbability) {
+          slotIndex += 1;
+          continue;
+        }
       }
+      const chartTime = measure.start + measure.duration * slot / measure.stepCount;
+      const audioTime = chartTime - prepared.chart.offset;
+      if (audioTime >= 0 && audioTime < envelope.duration) {
+        result.push({
+          label,
+          features: makeFeatures(envelope, audioTime, slot, measure.stepCount, measure.beats, measure.bpm, prepared.chart.level, prepared.chart.courseIndex)
+        });
+      }
+      slotIndex += 1;
     }
-    result.push(sample);
-    slotIndex += 1;
   }
   return result;
 }
@@ -524,84 +606,22 @@ function normalized(frames, seconds, scale) {
   return Math.min(1, frames[index] / scale);
 }
 
-function createModel(featureCount) {
-  return Array.from({ length: CLASS_COUNT }, () => new Float64Array(featureCount + 1));
-}
-
-function makeClassWeights(counts) {
-  const maxPositive = Math.max(1, ...counts.slice(1));
-  return counts.map((count, index) => index === 0 ? 1 : Math.min(4, Math.sqrt(maxPositive / Math.max(1, count))));
-}
-
-function trainExample(model, features, label, classWeights) {
-  const logits = model.map((weights) => {
-    let value = weights[features.length];
-    for (let index = 0; index < features.length; index += 1) value += weights[index] * features[index];
-    return value;
-  });
-  const maximum = Math.max(...logits);
-  const exponentials = logits.map((value) => Math.exp(value - maximum));
-  const normalizer = exponentials.reduce((sum, value) => sum + value, 0);
-  const learningRate = 0.025 / (1 + updateCount / 250000);
-  for (let category = 0; category < CLASS_COUNT; category += 1) {
-    const error = (exponentials[category] / normalizer - (category === label ? 1 : 0)) * classWeights[category];
-    const weights = model[category];
-    for (let index = 0; index < features.length; index += 1) {
-      weights[index] -= learningRate * (error * features[index] + 0.0001 * weights[index]);
-    }
-    weights[features.length] -= learningRate * error;
-  }
-  updateCount += 1;
-}
-
-function predict(model, features) {
-  let bestClass = 0;
-  let bestScore = -Infinity;
-  for (let category = 0; category < CLASS_COUNT; category += 1) {
-    let score = model[category][features.length];
-    for (let index = 0; index < features.length; index += 1) {
-      score += model[category][index] * features[index];
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      bestClass = category;
-    }
-  }
-  return bestClass;
-}
-
-function calculateMetrics(confusion) {
-  const total = confusion.flat().reduce((sum, count) => sum + count, 0);
-  const correct = confusion.reduce((sum, row, index) => sum + row[index], 0);
-  const scores = confusion.map((row, index) => {
-    const tp = row[index];
-    const actual = row.reduce((sum, count) => sum + count, 0);
-    const predicted = confusion.reduce((sum, values) => sum + values[index], 0);
-    const precision = tp / Math.max(1, predicted);
-    const recall = tp / Math.max(1, actual);
-    return { support: actual, precision, recall, f1: 2 * precision * recall / Math.max(1e-12, precision + recall) };
-  });
-  const noteActual = total - confusion[0].reduce((sum, count) => sum + count, 0);
-  const notePredicted = total - confusion.reduce((sum, row) => sum + row[0], 0);
-  const noteTruePositive = confusion.slice(1).reduce((sum, row) => sum + row.slice(1).reduce((inner, count) => inner + count, 0), 0);
-  const notePrecision = noteTruePositive / Math.max(1, notePredicted);
-  const noteRecall = noteTruePositive / Math.max(1, noteActual);
-  return {
-    accuracy: correct / Math.max(1, total),
-    notePresence: {
-      precision: notePrecision,
-      recall: noteRecall,
-      f1: 2 * notePrecision * noteRecall / Math.max(1e-12, notePrecision + noteRecall)
-    },
-    classMetrics: scores,
-    confusionMatrix: confusion
-  };
-}
-
 function percentile(values, fraction) {
   if (!values.length) return 0;
   const sorted = Array.from(values).sort((a, b) => a - b);
   return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))] ?? 0;
+}
+
+function summarize(values) {
+  if (!values.length) return { chartCount: 0 };
+  const sorted = [...values].sort((left, right) => left - right);
+  const quantile = (fraction) => sorted[Math.floor((sorted.length - 1) * fraction)];
+  return {
+    chartCount: sorted.length,
+    medianNotesPerSecond: quantile(0.5),
+    p75NotesPerSecond: quantile(0.75),
+    p90NotesPerSecond: quantile(0.9)
+  };
 }
 
 function leastCommonMultiple(left, right) {
@@ -622,30 +642,12 @@ function hashFraction(value) {
   return (hash >>> 0) / 0x100000000;
 }
 
-function seededRandom(seed) {
-  let state = seed >>> 0;
-  return () => {
-    state += 0x6D2B79F5;
-    let value = state;
-    value = Math.imul(value ^ (value >>> 15), value | 1);
-    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
-    return ((value ^ (value >>> 14)) >>> 0) / 0x100000000;
-  };
-}
-
-function shuffle(values, random) {
-  for (let index = values.length - 1; index > 0; index -= 1) {
-    const target = Math.floor(random() * (index + 1));
-    [values[index], values[target]] = [values[target], values[index]];
-  }
-}
-
 function printProgress(label, current, total) {
   process.stdout.write(`\r${label}: ${current}/${total}`);
 }
 
 function parseArgs(args) {
-  const result = { dataDir: "", limit: null, help: false };
+  const result = { dataDir: "", limit: null, epochs: 3, python: process.env.PYTHON || "python", help: false };
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--help" || arg === "-h") result.help = true;
@@ -654,6 +656,15 @@ function parseArgs(args) {
       const limit = Number(args[++index]);
       if (!Number.isInteger(limit) || limit < 3) throw new Error("--limitには3以上の整数を指定してください。");
       result.limit = limit;
+    } else if (arg === "--python") {
+      result.python = args[++index] || "";
+      if (!result.python) throw new Error("--pythonにはPython実行ファイルのパスを指定してください。");
+    } else if (arg === "--epochs") {
+      const epochs = Number(args[++index]);
+      if (!Number.isInteger(epochs) || epochs < 1 || epochs > 20) {
+        throw new Error("--epochsには1から20の整数を指定してください。");
+      }
+      result.epochs = epochs;
     } else {
       throw new Error(`不明なオプションです: ${arg}`);
     }
@@ -663,6 +674,6 @@ function parseArgs(args) {
 }
 
 function printHelp() {
-  console.log("Usage: node tools/train-chart-model.mjs --data-dir <TJAフォルダー> [--limit <音源数>]");
-  console.log("音源はローカルのffmpegで解析し、学習結果はデータフォルダー内に保存します。");
+  console.log("Usage: node tools/train-chart-model.mjs --data-dir <TJAフォルダー> [--limit <音源数>] [--epochs <1-20>] [--python <Python実行ファイル>]");
+  console.log("音源はローカルのffmpegで解析し、NumPyで学習します。学習結果はデータフォルダー内に保存します。");
 }
