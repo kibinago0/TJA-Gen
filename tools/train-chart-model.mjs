@@ -325,8 +325,12 @@ function collectRhythmProfiles(groups, report) {
         chartCount: 0,
         gapCounts: new Array(513).fill(0),
         phaseCounts: new Array(16).fill(0),
+        bigNotePhaseCounts: new Array(16).fill(0),
+        regularNotePhaseCounts: new Array(16).fill(0),
         noteTransitions: new Array(25).fill(0),
         noteCount: 0,
+        bigNoteCount: 0,
+        regularNoteCount: 0,
         barlineRestCount: 0
       };
       profile.chartCount += 1;
@@ -339,6 +343,16 @@ function collectRhythmProfiles(groups, report) {
           const measurePhase = slot / measure.stepCount;
           profile.phaseCounts[Math.min(15, Math.floor(measurePhase * 16))] += 1;
           profile.noteCount += 1;
+          if (label >= 1 && label <= 4) {
+            const phase = Math.min(15, Math.floor(measurePhase * 16));
+            if (label === 3 || label === 4) {
+              profile.bigNotePhaseCounts[phase] += 1;
+              profile.bigNoteCount += 1;
+            } else {
+              profile.regularNotePhaseCounts[phase] += 1;
+              profile.regularNoteCount += 1;
+            }
+          }
           events.push({
             position: chartBeat + measurePhase * measure.beats,
             measurePhase,

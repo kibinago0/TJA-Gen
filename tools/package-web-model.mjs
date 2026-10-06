@@ -42,7 +42,8 @@ try {
     evaluation = {
       audioGroups: report.audioGroups,
       validationAudioGroups: report.validationAudioGroups,
-      noteF1: report.metrics?.notePresence?.f1 ?? null
+      noteF1: report.metrics?.notePresence?.f1 ?? null,
+      bigNoteF1: report.metrics?.bigNotePlacement?.f1 ?? null
     };
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
@@ -76,10 +77,19 @@ function validateRhythmProfile(profile) {
     throw new Error("リズム学習データの形式が不正です。");
   }
   for (const course of Object.values(profile.courses)) {
+    const hasBigNotePhases = course.bigNotePhaseCounts !== undefined
+      || course.regularNotePhaseCounts !== undefined;
     if (!Array.isArray(course.gapCounts) || course.gapCounts.length !== 513
       || !Array.isArray(course.phaseCounts) || course.phaseCounts.length !== 16
       || !Array.isArray(course.noteTransitions) || course.noteTransitions.length !== 25
+      || (hasBigNotePhases && (
+        !Array.isArray(course.bigNotePhaseCounts) || course.bigNotePhaseCounts.length !== 16
+        || !Array.isArray(course.regularNotePhaseCounts) || course.regularNotePhaseCounts.length !== 16
+        || !Number.isInteger(course.bigNoteCount) || course.bigNoteCount < 0
+        || !Number.isInteger(course.regularNoteCount) || course.regularNoteCount < 0
+      ))
       || [...course.gapCounts, ...course.phaseCounts, ...course.noteTransitions]
+        .concat(course.bigNotePhaseCounts ?? [], course.regularNotePhaseCounts ?? [])
         .some((count) => !Number.isInteger(count) || count < 0)) {
       throw new Error("リズム学習データの統計値が不正です。");
     }

@@ -33,6 +33,16 @@ def calculate_metrics(confusion):
     note_true_positive = int(confusion[1:, 1:].sum())
     note_precision = note_true_positive / max(1, note_predicted)
     note_recall = note_true_positive / max(1, note_actual)
+    big_note_classes = (3, 4)
+    big_note_actual = sum(int(confusion[index].sum()) for index in big_note_classes)
+    big_note_predicted = sum(int(confusion[:, index].sum()) for index in big_note_classes)
+    big_note_true_positive = sum(
+        int(confusion[actual, predicted])
+        for actual in big_note_classes
+        for predicted in big_note_classes
+    )
+    big_note_precision = big_note_true_positive / max(1, big_note_predicted)
+    big_note_recall = big_note_true_positive / max(1, big_note_actual)
     return {
         "accuracy": correct / max(1, total),
         "notePresence": {
@@ -41,6 +51,14 @@ def calculate_metrics(confusion):
             "f1": 2 * note_precision * note_recall / max(
                 1e-12, note_precision + note_recall
             ),
+        },
+        "bigNotePlacement": {
+            "precision": big_note_precision,
+            "recall": big_note_recall,
+            "f1": 2 * big_note_precision * big_note_recall / max(
+                1e-12, big_note_precision + big_note_recall
+            ),
+            "support": big_note_actual,
         },
         "classMetrics": class_metrics,
         "confusionMatrix": confusion.tolist(),
