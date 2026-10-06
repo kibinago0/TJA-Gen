@@ -48,18 +48,42 @@ try {
     if (error.code !== "ENOENT") throw error;
   }
 
+  let rhythm = null;
+  try {
+    rhythm = JSON.parse(await readFile(path.join(path.dirname(inputPath), "rhythm-profile.json"), "utf8"));
+    validateRhythmProfile(rhythm);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+
   const artifact = {
     formatVersion: model.formatVersion,
     classes: model.classes,
     features: model.features,
     weights: model.weights,
-    evaluation
+    evaluation,
+    rhythm
   };
   await writeFile(outputPath, `window.TJAChartModel = ${JSON.stringify(artifact)};\n`, "utf8");
   console.log(`Web用モデルを書き出しました: ${outputPath}`);
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   process.exitCode = 1;
+}
+
+function validateRhythmProfile(profile) {
+  if (profile.formatVersion !== 1 || !profile.courses || typeof profile.courses !== "object") {
+    throw new Error("リズム学習データの形式が不正です。");
+  }
+  for (const course of Object.values(profile.courses)) {
+    if (!Array.isArray(course.gapCounts) || course.gapCounts.length !== 513
+      || !Array.isArray(course.phaseCounts) || course.phaseCounts.length !== 16
+      || !Array.isArray(course.noteTransitions) || course.noteTransitions.length !== 25
+      || [...course.gapCounts, ...course.phaseCounts, ...course.noteTransitions]
+        .some((count) => !Number.isInteger(count) || count < 0)) {
+      throw new Error("リズム学習データの統計値が不正です。");
+    }
+  }
 }
 
 function validateModel(model) {

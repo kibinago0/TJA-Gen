@@ -67,6 +67,14 @@ const summary = {
 
 try {
   const groups = await loadChartGroups(root, summary);
+  if (options.rhythmOnly) {
+    const rhythm = collectRhythmProfiles(groups, summary);
+    await mkdir(outputDir, { recursive: true });
+    await writeFile(path.join(outputDir, "rhythm-profile.json"), JSON.stringify(rhythm, null, 2), "utf8");
+    console.log(`リズム統計を保存しました: ${path.join(outputDir, "rhythm-profile.json")}`);
+    console.log(`対象TJA: ${summary.tjaFiles} / 読み取った譜面: ${summary.charts}`);
+    process.exit(0);
+  }
   if (groups.length < 3) {
     throw new Error("音源が3曲未満です。少なくとも3つの対応音源が必要です。");
   }
@@ -287,11 +295,13 @@ async function loadChartGroups(dataDir, report) {
         countUnsupported(report, "invalid_level");
         continue;
       }
-      try {
-        await access(chart.audioPath);
-      } catch {
-        report.missingAudio += 1;
-        continue;
+      if (!options.rhythmOnly) {
+        try {
+          await access(chart.audioPath);
+        } catch {
+          report.missingAudio += 1;
+          continue;
+        }
       }
       const key = path.resolve(chart.audioPath).toLowerCase();
       if (!byAudio.has(key)) byAudio.set(key, { audioPath: chart.audioPath, charts: [] });
@@ -299,6 +309,58 @@ async function loadChartGroups(dataDir, report) {
     }
   }
   return [...byAudio.values()].sort((a, b) => a.audioPath.localeCompare(b.audioPath));
+}
+
+function collectRhythmProfiles(groups, report) {
+  const profiles = {};
+  for (const group of groups) {
+    for (const chart of group.charts) {
+      const prepared = prepareChart(chart);
+      if (!prepared.ok) {
+        countUnsupported(report, prepared.reason);
+        continue;
+      }
+      const course = ["Easy", "Normal", "Hard", "Oni", "Edit"][chart.courseIndex];
+      const profile = profiles[course] ??= {
+        chartCount: 0,
+        gapCounts: new Array(513).fill(0),
+        phaseCounts: new Array(16).fill(0),
+        noteTransitions: new Array(25).fill(0),
+        noteCount: 0,
+        barlineRestCount: 0
+      };
+      profile.chartCount += 1;
+      const events = [];
+      let chartBeat = 0;
+      for (const measure of prepared.measures) {
+        for (let slot = 0; slot < measure.stepCount; slot += 1) {
+          const label = measure.labels[slot];
+          if (label === 0) continue;
+          const measurePhase = slot / measure.stepCount;
+          profile.phaseCounts[Math.min(15, Math.floor(measurePhase * 16))] += 1;
+          profile.noteCount += 1;
+          events.push({
+            position: chartBeat + measurePhase * measure.beats,
+            measurePhase,
+            label
+          });
+        }
+        chartBeat += measure.beats;
+      }
+      for (let index = 1; index < events.length; index += 1) {
+        const previous = events[index - 1];
+        const current = events[index];
+        const gapInSixteenths = (current.position - previous.position) * 4;
+        const bucket = Math.max(1, Math.min(512, Math.round(gapInSixteenths * 8)));
+        profile.gapCounts[bucket] += 1;
+        if (previous.label <= 4 && current.label <= 4) {
+          profile.noteTransitions[previous.label * 5 + current.label] += 1;
+        }
+        if (current.measurePhase < previous.measurePhase) profile.barlineRestCount += 1;
+      }
+    }
+  }
+  return { formatVersion: 1, gapUnit: "1/8 of a sixteenth note", courses: profiles };
 }
 
 function parseTja(text, directory) {
@@ -647,10 +709,18 @@ function printProgress(label, current, total) {
 }
 
 function parseArgs(args) {
-  const result = { dataDir: "", limit: null, epochs: 3, python: process.env.PYTHON || "python", help: false };
+  const result = {
+    dataDir: "",
+    limit: null,
+    epochs: 3,
+    python: process.env.PYTHON || "python",
+    rhythmOnly: false,
+    help: false
+  };
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--help" || arg === "-h") result.help = true;
+    else if (arg === "--rhythm-only") result.rhythmOnly = true;
     else if (arg === "--data-dir") result.dataDir = args[++index] || "";
     else if (arg === "--limit") {
       const limit = Number(args[++index]);
@@ -674,6 +744,6 @@ function parseArgs(args) {
 }
 
 function printHelp() {
-  console.log("Usage: node tools/train-chart-model.mjs --data-dir <TJAフォルダー> [--limit <音源数>] [--epochs <1-20>] [--python <Python実行ファイル>]");
+  console.log("Usage: node tools/train-chart-model.mjs --data-dir <TJAフォルダー> [--limit <音源数>] [--epochs <1-20>] [--python <Python実行ファイル>] [--rhythm-only]");
   console.log("音源はローカルのffmpegで解析し、NumPyで学習します。学習結果はデータフォルダー内に保存します。");
 }

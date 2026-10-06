@@ -223,12 +223,13 @@ function generateChart(audioBuffer, bpm, targetRate, measureResolution, course, 
 
   const measureDuration = 240 / bpm;
   const measureCount = Math.max(1, Math.ceil(audioBuffer.duration / measureDuration));
+  const measureNoteCounts = allocateMeasureNoteCounts(envelope, measureCount, measureDuration, targetRate, measureResolution);
   const measures = [];
+  const measurePatterns = [];
   let noteCount = 0;
   for (let measureIndex = 0; measureIndex < measureCount; measureIndex += 1) {
     const measureStart = measureIndex * measureDuration;
-    const measureLength = Math.min(measureDuration, audioBuffer.duration - measureStart);
-    const targetCount = Math.min(measureResolution, Math.round(targetRate * measureLength));
+    const targetCount = measureNoteCounts[measureIndex];
     const candidates = [];
     for (let slot = 0; slot < measureResolution; slot += 1) {
       const time = measureStart + measureDuration * slot / measureResolution;
@@ -238,8 +239,18 @@ function generateChart(audioBuffer, bpm, targetRate, measureResolution, course, 
         : scoreByAmplitude(envelope, time, slot, measureResolution);
       candidates.push({ ...candidate, slot });
     }
-    candidates.sort((left, right) => right.score - left.score || left.slot - right.slot);
-    const selected = new Map(candidates.slice(0, targetCount).map((candidate) => [candidate.slot, candidate.note]));
+    const phraseReferenceIndex = measureIndex % 4 === 0 ? measureIndex - 4 : measureIndex - 1;
+    const phraseReference = phraseReferenceIndex >= 0 ? measurePatterns[phraseReferenceIndex] : null;
+    const rhythmProfile = model?.rhythm?.courses?.[course] ?? null;
+    const selected = selectHumanizedNotes(
+      candidates,
+      targetCount,
+      measureResolution,
+      rhythmProfile,
+      phraseReference,
+      measureIndex % 4 === 0
+    );
+    measurePatterns.push(new Set(selected.keys()));
     let row = "";
     for (let slot = 0; slot < measureResolution; slot += 1) {
       row += String(selected.get(slot) ?? 0);
@@ -251,6 +262,166 @@ function generateChart(audioBuffer, bpm, targetRate, measureResolution, course, 
     throw new Error("目標密度が低すぎるため音符がありません。打/秒を上げてください。");
   }
   return { measures, noteCount, actualRate: noteCount / audioBuffer.duration };
+}
+
+function allocateMeasureNoteCounts(envelope, measureCount, measureDuration, targetRate, measureResolution) {
+  const capacities = [];
+  const activities = [];
+  for (let measure = 0; measure < measureCount; measure += 1) {
+    const start = measure * measureDuration;
+    const duration = Math.min(measureDuration, envelope.duration - start);
+    const firstFrame = Math.max(0, Math.floor(start / envelope.frameSeconds));
+    const lastFrame = Math.min(envelope.rms.length, Math.ceil((start + duration) / envelope.frameSeconds));
+    let energy = 0;
+    for (let frame = firstFrame; frame < lastFrame; frame += 1) {
+      energy += envelope.rms[frame] * envelope.rms[frame];
+    }
+    const meanRms = Math.sqrt(energy / Math.max(1, lastFrame - firstFrame));
+    capacities.push(Math.min(measureResolution, Math.ceil(duration / measureDuration * measureResolution)));
+    activities.push(meanRms);
+  }
+
+  const totalCapacity = capacities.reduce((sum, capacity) => sum + capacity, 0);
+  let remaining = Math.min(totalCapacity, Math.round(targetRate * envelope.duration));
+  const counts = new Array(measureCount).fill(0);
+  const maxActivity = Math.max(...activities, 1e-8);
+  const weights = activities.map((activity) => 0.65 + 0.7 * Math.sqrt(activity / maxActivity));
+
+  while (remaining > 0) {
+    const active = capacities.map((capacity, index) => index).filter((index) => counts[index] < capacities[index]);
+    const totalWeight = active.reduce((sum, index) => sum + weights[index], 0);
+    const quotas = active.map((index) => ({
+      index,
+      exact: remaining * weights[index] / totalWeight
+    }));
+    let assigned = 0;
+    for (const quota of quotas) {
+      const add = Math.min(
+        capacities[quota.index] - counts[quota.index],
+        Math.floor(quota.exact)
+      );
+      if (add > 0) {
+        counts[quota.index] += add;
+        assigned += add;
+      }
+    }
+    remaining -= assigned;
+    if (remaining === 0) break;
+    const ranked = quotas
+      .filter(({ index }) => counts[index] < capacities[index])
+      .sort((left, right) => (right.exact - Math.floor(right.exact)) - (left.exact - Math.floor(left.exact)));
+    if (!ranked.length) break;
+    for (const quota of ranked) {
+      if (remaining === 0) break;
+      counts[quota.index] += 1;
+      remaining -= 1;
+    }
+  }
+  return counts;
+}
+
+function selectHumanizedNotes(candidates, targetCount, measureResolution, profile, phraseReference, reprise) {
+  if (targetCount <= 0 || !candidates.length) return new Map();
+  if (targetCount >= candidates.length) {
+    return new Map(candidates.map((candidate) => [candidate.slot, candidate.note]));
+  }
+
+  const scoreMean = candidates.reduce((sum, candidate) => sum + candidate.score, 0) / candidates.length;
+  const scoreVariance = candidates.reduce((sum, candidate) => sum + (candidate.score - scoreMean) ** 2, 0) / candidates.length;
+  const scoreScale = Math.max(0.0001, Math.sqrt(scoreVariance));
+  const phaseCounts = profile?.phaseCounts ?? [];
+  const phaseTotal = phaseCounts.reduce((sum, value) => sum + value, 0);
+  const phaseScores = candidates.map((candidate) => {
+    const phase = Math.min(15, Math.floor(candidate.slot / measureResolution * 16));
+    const phaseProbability = phaseTotal
+      ? (phaseCounts[phase] + 1) / (phaseTotal + 16)
+      : defaultPhaseProbability(phase);
+    return 0.3 * Math.log(phaseProbability * 16);
+  });
+  const noteScores = candidates.map((candidate, index) => {
+    const acoustic = Math.max(-3, Math.min(3, (candidate.score - scoreMean) / scoreScale));
+    const matchingPhraseSlot = phraseReference?.has(candidate.slot) ?? false;
+    const phraseVariation = matchingPhraseSlot ? (reprise ? 0.12 : -0.2) : 0;
+    return acoustic + phaseScores[index] + phraseVariation;
+  });
+
+  let previous = new Float64Array(candidates.length).fill(-Infinity);
+  for (let index = 0; index < candidates.length; index += 1) {
+    previous[index] = noteScores[index];
+  }
+  const backPointers = Array.from(
+    { length: targetCount },
+    () => new Int16Array(candidates.length).fill(-1)
+  );
+
+  for (let count = 2; count <= targetCount; count += 1) {
+    const current = new Float64Array(candidates.length).fill(-Infinity);
+    for (let right = count - 1; right < candidates.length; right += 1) {
+      for (let left = count - 2; left < right; left += 1) {
+        if (!Number.isFinite(previous[left])) continue;
+        const gapUnits = (candidates[right].slot - candidates[left].slot) / measureResolution * 16;
+        const gapScore = rhythmGapScore(profile, gapUnits);
+        const transitionScore = rhythmTransitionScore(profile, candidates[left].note, candidates[right].note);
+        const score = previous[left] + 0.55 * gapScore + 0.25 * transitionScore;
+        if (score > current[right]) {
+          current[right] = score;
+          backPointers[count - 1][right] = left;
+        }
+      }
+      current[right] += noteScores[right];
+    }
+    previous = current;
+  }
+
+  let last = -1;
+  let bestScore = -Infinity;
+  for (let index = targetCount - 1; index < candidates.length; index += 1) {
+    if (previous[index] > bestScore) {
+      bestScore = previous[index];
+      last = index;
+    }
+  }
+  const selected = new Map();
+  for (let count = targetCount - 1; count >= 0; count -= 1) {
+    if (last < 0) throw new Error("リズムに沿った音符配置を決められませんでした。");
+    selected.set(candidates[last].slot, candidates[last].note);
+    last = backPointers[count][last];
+  }
+  return selected;
+}
+
+function rhythmGapScore(profile, gapUnits) {
+  const gapCounts = profile?.gapCounts;
+  if (!Array.isArray(gapCounts) || gapCounts.length !== 513) {
+    return Math.log(defaultGapProbability(gapUnits) * 64);
+  }
+  const bucket = Math.max(1, Math.min(512, Math.round(gapUnits * 8)));
+  const count = gapCounts[bucket] + (gapCounts[bucket - 1] ?? 0) * 0.5 + (gapCounts[bucket + 1] ?? 0) * 0.5;
+  const total = gapCounts.reduce((sum, value) => sum + value, 0);
+  return Math.log((count + 0.5) / (total + 256));
+}
+
+function rhythmTransitionScore(profile, previousNote, nextNote) {
+  const transitions = profile?.noteTransitions;
+  if (!Array.isArray(transitions) || transitions.length !== 25) {
+    return previousNote === nextNote ? -0.2 : 0.1;
+  }
+  const rowStart = previousNote * 5;
+  const rowTotal = transitions.slice(rowStart + 1, rowStart + 5).reduce((sum, value) => sum + value, 0);
+  const count = transitions[rowStart + nextNote] ?? 0;
+  return Math.log((count + 1) / (rowTotal + 4)) * 0.25;
+}
+
+function defaultPhaseProbability(phase) {
+  return [0, 4, 8, 12].includes(phase) ? 0.11 : [2, 6, 10, 14].includes(phase) ? 0.08 : 0.06;
+}
+
+function defaultGapProbability(gapUnits) {
+  const favored = [
+    [1, 0.4], [2, 0.8], [3, 0.35], [4, 1], [6, 0.45],
+    [8, 0.75], [12, 0.4], [16, 0.65], [24, 0.3], [32, 0.5]
+  ];
+  return favored.reduce((sum, [gap, weight]) => sum + weight * Math.exp(-Math.abs(gapUnits - gap) / 0.5), 0) / 5.6;
 }
 
 function estimateBpm(onset) {
