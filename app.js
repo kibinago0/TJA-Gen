@@ -223,34 +223,56 @@ function generateChart(audioBuffer, bpm, targetRate, measureResolution, course, 
 
   const measureDuration = 240 / bpm;
   const measureCount = Math.max(1, Math.ceil(audioBuffer.duration / measureDuration));
-  const measureNoteCounts = allocateMeasureNoteCounts(envelope, measureCount, measureDuration, targetRate, measureResolution);
-  const measures = [];
-  const measurePatterns = [];
-  let noteCount = 0;
+  const minimumGap = Math.max(1, Math.ceil(measureResolution / 48));
+  const candidateGroups = [];
   for (let measureIndex = 0; measureIndex < measureCount; measureIndex += 1) {
     const measureStart = measureIndex * measureDuration;
-    const targetCount = measureNoteCounts[measureIndex];
     const candidates = [];
     for (let slot = 0; slot < measureResolution; slot += 1) {
       const time = measureStart + measureDuration * slot / measureResolution;
       if (time >= audioBuffer.duration) continue;
+      const activity = audioActivity(envelope, time);
+      if (!activity.active) continue;
       const candidate = algorithm === "learned"
         ? scoreWithModel(model, envelope, time, slot, measureResolution, bpm, level, courseIndex)
         : scoreByAmplitude(envelope, time, slot, measureResolution);
-      candidates.push({ ...candidate, slot });
+      candidates.push({ ...candidate, activity: activity.score, slot });
     }
+    candidateGroups.push(candidates);
+  }
+  if (!candidateGroups.some((candidates) => candidates.length > 0)) {
+    throw new Error("音源に音符を置ける音量の部分が見つかりませんでした。別の音源をお試しください。");
+  }
+  const measureNoteCounts = allocateMeasureNoteCounts(
+    candidateGroups,
+    Math.round(targetRate * envelope.duration),
+    minimumGap
+  );
+  const measures = [];
+  const measurePatterns = [];
+  let noteCount = 0;
+  let previousMeasureLastSlot = null;
+  for (let measureIndex = 0; measureIndex < measureCount; measureIndex += 1) {
+    const targetCount = measureNoteCounts[measureIndex];
+    const candidates = candidateGroups[measureIndex];
     const phraseReferenceIndex = measureIndex % 4 === 0 ? measureIndex - 4 : measureIndex - 1;
     const phraseReference = phraseReferenceIndex >= 0 ? measurePatterns[phraseReferenceIndex] : null;
     const rhythmProfile = model?.rhythm?.courses?.[course] ?? null;
-    const selected = selectHumanizedNotes(
-      candidates,
-      targetCount,
-      measureResolution,
-      rhythmProfile,
-      phraseReference,
-      measureIndex % 4 === 0
-    );
+    let selected = null;
+    for (let count = targetCount; count >= 0 && selected === null; count -= 1) {
+      selected = selectHumanizedNotes(
+        candidates,
+        count,
+        measureResolution,
+        minimumGap,
+        rhythmProfile,
+        phraseReference,
+        measureIndex % 4 === 0,
+        previousMeasureLastSlot
+      );
+    }
     measurePatterns.push(new Set(selected.keys()));
+    previousMeasureLastSlot = selected.size ? Math.max(...selected.keys()) : null;
     let row = "";
     for (let slot = 0; slot < measureResolution; slot += 1) {
       row += String(selected.get(slot) ?? 0);
@@ -264,26 +286,15 @@ function generateChart(audioBuffer, bpm, targetRate, measureResolution, course, 
   return { measures, noteCount, actualRate: noteCount / audioBuffer.duration };
 }
 
-function allocateMeasureNoteCounts(envelope, measureCount, measureDuration, targetRate, measureResolution) {
-  const capacities = [];
-  const activities = [];
-  for (let measure = 0; measure < measureCount; measure += 1) {
-    const start = measure * measureDuration;
-    const duration = Math.min(measureDuration, envelope.duration - start);
-    const firstFrame = Math.max(0, Math.floor(start / envelope.frameSeconds));
-    const lastFrame = Math.min(envelope.rms.length, Math.ceil((start + duration) / envelope.frameSeconds));
-    let energy = 0;
-    for (let frame = firstFrame; frame < lastFrame; frame += 1) {
-      energy += envelope.rms[frame] * envelope.rms[frame];
-    }
-    const meanRms = Math.sqrt(energy / Math.max(1, lastFrame - firstFrame));
-    capacities.push(Math.min(measureResolution, Math.ceil(duration / measureDuration * measureResolution)));
-    activities.push(meanRms);
-  }
-
+function allocateMeasureNoteCounts(candidateGroups, targetTotal, minimumGap) {
+  const capacities = candidateGroups.map((candidates) => maxSeparatedNoteCount(candidates, minimumGap));
+  const activities = candidateGroups.map((candidates) => {
+    if (!candidates.length) return 0;
+    return candidates.reduce((sum, candidate) => sum + candidate.activity, 0) / candidates.length;
+  });
   const totalCapacity = capacities.reduce((sum, capacity) => sum + capacity, 0);
-  let remaining = Math.min(totalCapacity, Math.round(targetRate * envelope.duration));
-  const counts = new Array(measureCount).fill(0);
+  const counts = new Array(candidateGroups.length).fill(0);
+  let remaining = Math.min(totalCapacity, targetTotal);
   const maxActivity = Math.max(...activities, 1e-8);
   const weights = activities.map((activity) => 0.65 + 0.7 * Math.sqrt(activity / maxActivity));
 
@@ -320,11 +331,47 @@ function allocateMeasureNoteCounts(envelope, measureCount, measureDuration, targ
   return counts;
 }
 
-function selectHumanizedNotes(candidates, targetCount, measureResolution, profile, phraseReference, reprise) {
-  if (targetCount <= 0 || !candidates.length) return new Map();
-  if (targetCount >= candidates.length) {
-    return new Map(candidates.map((candidate) => [candidate.slot, candidate.note]));
+function maxSeparatedNoteCount(candidates, minimumGap) {
+  let count = 0;
+  let previousSlot = -Infinity;
+  for (const candidate of candidates) {
+    if (candidate.slot - previousSlot < minimumGap) continue;
+    previousSlot = candidate.slot;
+    count += 1;
   }
+  return count;
+}
+
+function audioActivity(envelope, seconds) {
+  const center = Math.round(seconds / envelope.frameSeconds);
+  const radius = Math.max(1, Math.round(0.05 / envelope.frameSeconds));
+  let peakRms = 0;
+  let peakOnset = 0;
+  for (let frame = center; frame <= Math.min(envelope.rms.length - 1, center + radius); frame += 1) {
+    peakRms = Math.max(peakRms, envelope.rms[frame] / Math.max(envelope.rmsScale, 1e-8));
+    peakOnset = Math.max(peakOnset, envelope.onset[frame] / Math.max(envelope.onsetScale, 1e-8));
+  }
+  const rmsActivity = Math.min(1, peakRms);
+  const onsetActivity = Math.min(1, peakOnset);
+  return {
+    active: rmsActivity >= 0.12 || (rmsActivity >= 0.05 && onsetActivity >= 0.18),
+    score: Math.max(rmsActivity, onsetActivity * 0.65)
+  };
+}
+
+function selectHumanizedNotes(
+  candidates,
+  targetCount,
+  measureResolution,
+  minimumGap,
+  profile,
+  phraseReference,
+  reprise,
+  previousMeasureLastSlot
+) {
+  if (targetCount <= 0 || !candidates.length) return new Map();
+  targetCount = Math.min(targetCount, maxSeparatedNoteCount(candidates, minimumGap));
+  if (targetCount === 0) return new Map();
 
   const scoreMean = candidates.reduce((sum, candidate) => sum + candidate.score, 0) / candidates.length;
   const scoreVariance = candidates.reduce((sum, candidate) => sum + (candidate.score - scoreMean) ** 2, 0) / candidates.length;
@@ -347,7 +394,9 @@ function selectHumanizedNotes(candidates, targetCount, measureResolution, profil
 
   let previous = new Float64Array(candidates.length).fill(-Infinity);
   for (let index = 0; index < candidates.length; index += 1) {
-    previous[index] = noteScores[index];
+    const crossesBarlineTooClosely = previousMeasureLastSlot !== null
+      && measureResolution - previousMeasureLastSlot + candidates[index].slot < minimumGap;
+    if (!crossesBarlineTooClosely) previous[index] = noteScores[index];
   }
   const backPointers = Array.from(
     { length: targetCount },
@@ -359,6 +408,7 @@ function selectHumanizedNotes(candidates, targetCount, measureResolution, profil
     for (let right = count - 1; right < candidates.length; right += 1) {
       for (let left = count - 2; left < right; left += 1) {
         if (!Number.isFinite(previous[left])) continue;
+        if (candidates[right].slot - candidates[left].slot < minimumGap) continue;
         const gapUnits = (candidates[right].slot - candidates[left].slot) / measureResolution * 16;
         const gapScore = rhythmGapScore(profile, gapUnits);
         const transitionScore = rhythmTransitionScore(profile, candidates[left].note, candidates[right].note);
@@ -383,7 +433,7 @@ function selectHumanizedNotes(candidates, targetCount, measureResolution, profil
   }
   const selected = new Map();
   for (let count = targetCount - 1; count >= 0; count -= 1) {
-    if (last < 0) throw new Error("リズムに沿った音符配置を決められませんでした。");
+    if (last < 0) return null;
     selected.set(candidates[last].slot, candidates[last].note);
     last = backPointers[count][last];
   }
