@@ -196,13 +196,16 @@ function createModelEnvelope(audioBuffer) {
   for (let frame = 1; frame < frameCount; frame += 1) {
     onset[frame] = Math.max(0, rms[frame] - rms[frame - 1]);
   }
+  const onsetScale = percentile(onset, 0.95);
   return {
     duration: audioBuffer.duration,
     frameSeconds: frameSize / targetSampleRate,
     rms,
     onset,
     rmsScale: percentile(rms, 0.95),
-    onsetScale: percentile(onset, 0.95)
+    onsetScale: onsetScale > 1e-8
+      ? onsetScale
+      : percentile(Array.from(onset).filter((value) => value > 0), 0.95)
   };
 }
 
@@ -224,6 +227,13 @@ function generateChart(audioBuffer, bpm, targetRate, measureResolution, course, 
   const measureDuration = 240 / bpm;
   const measureCount = Math.max(1, Math.ceil(audioBuffer.duration / measureDuration));
   const minimumGap = Math.max(1, Math.ceil(measureResolution / 48));
+  const minimumAttackGapFrames = Math.max(
+    1,
+    Math.ceil(minimumGap * measureDuration / measureResolution / envelope.frameSeconds)
+  );
+  const prominentAttackThreshold = 0.3;
+  const distinctAttackThreshold = 0.18;
+  const bigNoteThreshold = 0.85;
   const candidateGroups = [];
   for (let measureIndex = 0; measureIndex < measureCount; measureIndex += 1) {
     const measureStart = measureIndex * measureDuration;
@@ -236,7 +246,21 @@ function generateChart(audioBuffer, bpm, targetRate, measureResolution, course, 
       const candidate = algorithm === "learned"
         ? scoreWithModel(model, envelope, time, slot, measureResolution, bpm, level, courseIndex)
         : scoreByAmplitude(envelope, time, slot, measureResolution);
-      candidates.push({ ...candidate, activity: activity.score, slot });
+      const drumType = candidate.note === 2 || candidate.note === 4 ? 2 : 1;
+      const isProminent = activity.onset >= prominentAttackThreshold;
+      const isBig = isProminent && (
+        activity.onset >= bigNoteThreshold
+        || (activity.onset >= prominentAttackThreshold && activity.rms >= 1.8)
+      );
+      candidates.push({
+        ...candidate,
+        activity: activity.score,
+        hasNewAttack: activity.onset >= distinctAttackThreshold,
+        prominent: isProminent,
+        attackFrame: activity.attackFrame,
+        note: isBig ? drumType + 2 : drumType,
+        slot
+      });
     }
     candidateGroups.push(candidates);
   }
@@ -252,6 +276,8 @@ function generateChart(audioBuffer, bpm, targetRate, measureResolution, course, 
   const measurePatterns = [];
   let noteCount = 0;
   let previousMeasureLastSlot = null;
+  let previousMeasureLastProminent = false;
+  let previousMeasureLastAttackFrame = -1;
   for (let measureIndex = 0; measureIndex < measureCount; measureIndex += 1) {
     const targetCount = measureNoteCounts[measureIndex];
     const candidates = candidateGroups[measureIndex];
@@ -268,11 +294,19 @@ function generateChart(audioBuffer, bpm, targetRate, measureResolution, course, 
         rhythmProfile,
         phraseReference,
         measureIndex % 4 === 0,
-        previousMeasureLastSlot
+        previousMeasureLastSlot,
+        previousMeasureLastProminent,
+        previousMeasureLastAttackFrame,
+        minimumAttackGapFrames
       );
     }
     measurePatterns.push(new Set(selected.keys()));
     previousMeasureLastSlot = selected.size ? Math.max(...selected.keys()) : null;
+    if (selected.size) {
+      const lastCandidate = candidates.find((candidate) => candidate.slot === previousMeasureLastSlot);
+      previousMeasureLastProminent = lastCandidate.prominent;
+      previousMeasureLastAttackFrame = lastCandidate.attackFrame;
+    }
     let row = "";
     for (let slot = 0; slot < measureResolution; slot += 1) {
       row += String(selected.get(slot) ?? 0);
@@ -347,15 +381,23 @@ function audioActivity(envelope, seconds) {
   const radius = Math.max(1, Math.round(0.05 / envelope.frameSeconds));
   let peakRms = 0;
   let peakOnset = 0;
+  let attackFrame = center;
   for (let frame = center; frame <= Math.min(envelope.rms.length - 1, center + radius); frame += 1) {
     peakRms = Math.max(peakRms, envelope.rms[frame] / Math.max(envelope.rmsScale, 1e-8));
-    peakOnset = Math.max(peakOnset, envelope.onset[frame] / Math.max(envelope.onsetScale, 1e-8));
+    const normalizedOnset = envelope.onset[frame] / Math.max(envelope.onsetScale, 1e-8);
+    if (normalizedOnset > peakOnset) {
+      peakOnset = normalizedOnset;
+      attackFrame = frame;
+    }
   }
-  const rmsActivity = Math.min(1, peakRms);
-  const onsetActivity = Math.min(1, peakOnset);
+  const rmsActivity = peakRms;
+  const onsetActivity = peakOnset;
   return {
     active: rmsActivity >= 0.12 || (rmsActivity >= 0.05 && onsetActivity >= 0.18),
-    score: Math.max(rmsActivity, onsetActivity * 0.65)
+    score: Math.max(Math.min(1, rmsActivity), Math.min(1, onsetActivity * 0.65)),
+    rms: rmsActivity,
+    onset: onsetActivity,
+    attackFrame
   };
 }
 
@@ -367,7 +409,10 @@ function selectHumanizedNotes(
   profile,
   phraseReference,
   reprise,
-  previousMeasureLastSlot
+  previousMeasureLastSlot,
+  previousMeasureLastProminent,
+  previousMeasureLastAttackFrame,
+  minimumAttackGapFrames
 ) {
   if (targetCount <= 0 || !candidates.length) return new Map();
   targetCount = Math.min(targetCount, maxSeparatedNoteCount(candidates, minimumGap));
@@ -396,7 +441,11 @@ function selectHumanizedNotes(
   for (let index = 0; index < candidates.length; index += 1) {
     const crossesBarlineTooClosely = previousMeasureLastSlot !== null
       && measureResolution - previousMeasureLastSlot + candidates[index].slot < minimumGap;
-    if (!crossesBarlineTooClosely) previous[index] = noteScores[index];
+    const needsNewAttack = previousMeasureLastProminent && (
+      !candidates[index].hasNewAttack
+      || candidates[index].attackFrame - previousMeasureLastAttackFrame < minimumAttackGapFrames
+    );
+    if (!crossesBarlineTooClosely && !needsNewAttack) previous[index] = noteScores[index];
   }
   const backPointers = Array.from(
     { length: targetCount },
@@ -409,6 +458,10 @@ function selectHumanizedNotes(
       for (let left = count - 2; left < right; left += 1) {
         if (!Number.isFinite(previous[left])) continue;
         if (candidates[right].slot - candidates[left].slot < minimumGap) continue;
+        if (candidates[left].prominent && (
+          !candidates[right].hasNewAttack
+          || candidates[right].attackFrame - candidates[left].attackFrame < minimumAttackGapFrames
+        )) continue;
         const gapUnits = (candidates[right].slot - candidates[left].slot) / measureResolution * 16;
         const gapScore = rhythmGapScore(profile, gapUnits);
         const transitionScore = rhythmTransitionScore(profile, candidates[left].note, candidates[right].note);
