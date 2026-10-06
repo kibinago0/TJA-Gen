@@ -68,11 +68,12 @@ const summary = {
 try {
   const groups = await loadChartGroups(root, summary);
   if (options.rhythmOnly) {
-    const rhythm = collectRhythmProfiles(groups, summary);
+    const rhythm = await collectRhythmProfiles(groups, summary);
     await mkdir(outputDir, { recursive: true });
     await writeFile(path.join(outputDir, "rhythm-profile.json"), JSON.stringify(rhythm, null, 2), "utf8");
     console.log(`リズム統計を保存しました: ${path.join(outputDir, "rhythm-profile.json")}`);
     console.log(`対象TJA: ${summary.tjaFiles} / 読み取った譜面: ${summary.charts}`);
+    console.log(`音源と譜面を対応づけた小節: ${summary.jointMeasureSamples}`);
     process.exit(0);
   }
   if (groups.length < 3) {
@@ -295,13 +296,11 @@ async function loadChartGroups(dataDir, report) {
         countUnsupported(report, "invalid_level");
         continue;
       }
-      if (!options.rhythmOnly) {
-        try {
-          await access(chart.audioPath);
-        } catch {
-          report.missingAudio += 1;
-          continue;
-        }
+      try {
+        await access(chart.audioPath);
+      } catch {
+        report.missingAudio += 1;
+        continue;
       }
       const key = path.resolve(chart.audioPath).toLowerCase();
       if (!byAudio.has(key)) byAudio.set(key, { audioPath: chart.audioPath, charts: [] });
@@ -311,9 +310,12 @@ async function loadChartGroups(dataDir, report) {
   return [...byAudio.values()].sort((a, b) => a.audioPath.localeCompare(b.audioPath));
 }
 
-function collectRhythmProfiles(groups, report) {
+async function collectRhythmProfiles(groups, report) {
   const profiles = {};
+  let processed = 0;
+  report.jointMeasureSamples = 0;
   for (const group of groups) {
+    const envelope = await decodeAudio(group.audioPath);
     for (const chart of group.charts) {
       const prepared = prepareChart(chart);
       if (!prepared.ok) {
@@ -325,17 +327,29 @@ function collectRhythmProfiles(groups, report) {
         chartCount: 0,
         gapCounts: new Array(513).fill(0),
         phaseCounts: new Array(16).fill(0),
-        bigNotePhaseCounts: new Array(16).fill(0),
-        regularNotePhaseCounts: new Array(16).fill(0),
+        jointBigNoteCounts: new Array(256).fill(0),
+        jointRegularNoteCounts: new Array(256).fill(0),
+        jointMeasureDensity: {
+          sampleCounts: new Array(16).fill(0),
+          densityRatioSums: new Array(16).fill(0)
+        },
         noteTransitions: new Array(25).fill(0),
         noteCount: 0,
         bigNoteCount: 0,
         regularNoteCount: 0,
+        jointChartCount: 0,
+        jointMeasureCount: 0,
         barlineRestCount: 0
       };
       profile.chartCount += 1;
       const events = [];
       let chartBeat = 0;
+      const chartMeasureNoteCounts = prepared.measures.map(
+        (measure) => measure.labels.filter((label) => label >= 1 && label <= 4).length
+      );
+      const averageMeasureNoteCount = chartMeasureNoteCounts.reduce((sum, count) => sum + count, 0)
+        / Math.max(1, chartMeasureNoteCounts.length);
+      if (averageMeasureNoteCount > 0) profile.jointChartCount += 1;
       for (const measure of prepared.measures) {
         for (let slot = 0; slot < measure.stepCount; slot += 1) {
           const label = measure.labels[slot];
@@ -345,11 +359,17 @@ function collectRhythmProfiles(groups, report) {
           profile.noteCount += 1;
           if (label >= 1 && label <= 4) {
             const phase = Math.min(15, Math.floor(measurePhase * 16));
+            const audioTime = measure.start + measure.duration * measurePhase - chart.offset;
+            if (audioTime >= 0 && audioTime < envelope.duration) {
+              const activity = audioActivityScore(envelope, audioTime);
+              const activityBin = Math.min(15, Math.floor(activity * 16));
+              const jointIndex = activityBin * 16 + phase;
+              if (label === 3 || label === 4) profile.jointBigNoteCounts[jointIndex] += 1;
+              else profile.jointRegularNoteCounts[jointIndex] += 1;
+            }
             if (label === 3 || label === 4) {
-              profile.bigNotePhaseCounts[phase] += 1;
               profile.bigNoteCount += 1;
             } else {
-              profile.regularNotePhaseCounts[phase] += 1;
               profile.regularNoteCount += 1;
             }
           }
@@ -360,6 +380,21 @@ function collectRhythmProfiles(groups, report) {
           });
         }
         chartBeat += measure.beats;
+      }
+      if (averageMeasureNoteCount > 0) {
+        for (let index = 0; index < prepared.measures.length; index += 1) {
+          const measure = prepared.measures[index];
+          const measureStart = measure.start - chart.offset;
+          const activity = measureAudioActivity(envelope, measureStart, measure.duration);
+          const activityBin = Math.min(15, Math.floor(activity * 16));
+          profile.jointMeasureDensity.sampleCounts[activityBin] += 1;
+          profile.jointMeasureDensity.densityRatioSums[activityBin] += Math.min(
+            4,
+            chartMeasureNoteCounts[index] / averageMeasureNoteCount
+          );
+          profile.jointMeasureCount += 1;
+          report.jointMeasureSamples += 1;
+        }
       }
       for (let index = 1; index < events.length; index += 1) {
         const previous = events[index - 1];
@@ -373,8 +408,13 @@ function collectRhythmProfiles(groups, report) {
         if (current.measurePhase < previous.measurePhase) profile.barlineRestCount += 1;
       }
     }
+    processed += 1;
+    if (processed % 25 === 0 || processed === groups.length) {
+      printProgress("音源・譜面の対応学習", processed, groups.length);
+    }
   }
-  return { formatVersion: 1, gapUnit: "1/8 of a sixteenth note", courses: profiles };
+  console.log();
+  return { formatVersion: 2, gapUnit: "1/8 of a sixteenth note", courses: profiles };
 }
 
 function parseTja(text, directory) {
@@ -571,6 +611,29 @@ async function decodeAudio(file) {
   };
 }
 
+function audioActivityScore(envelope, seconds) {
+  if (seconds < 0 || seconds >= envelope.duration) return 0;
+  const center = Math.round(seconds / FRAME_SECONDS);
+  const radius = Math.max(1, Math.round(0.05 / FRAME_SECONDS));
+  let peakRms = 0;
+  let peakOnset = 0;
+  for (let frame = center; frame <= Math.min(envelope.rms.length - 1, center + radius); frame += 1) {
+    peakRms = Math.max(peakRms, normalized(envelope.rms, frame * FRAME_SECONDS, envelope.rmsScale));
+    peakOnset = Math.max(peakOnset, normalized(envelope.onset, frame * FRAME_SECONDS, envelope.onsetScale));
+  }
+  return Math.max(peakRms, peakOnset * 0.65);
+}
+
+function measureAudioActivity(envelope, measureStart, measureDuration) {
+  let activity = 0;
+  const sampleCount = 16;
+  for (let index = 0; index < sampleCount; index += 1) {
+    const seconds = measureStart + measureDuration * (index + 0.5) / sampleCount;
+    activity += audioActivityScore(envelope, seconds);
+  }
+  return activity / sampleCount;
+}
+
 function prepareChart(chart) {
   if (chart.parseReason) return { ok: false, reason: chart.parseReason };
   if (!chart.measures.length) return { ok: false, reason: "empty_chart" };
@@ -759,5 +822,6 @@ function parseArgs(args) {
 
 function printHelp() {
   console.log("Usage: node tools/train-chart-model.mjs --data-dir <TJAフォルダー> [--limit <音源数>] [--epochs <1-20>] [--python <Python実行ファイル>] [--rhythm-only]");
-  console.log("音源はローカルのffmpegで解析し、NumPyで学習します。学習結果はデータフォルダー内に保存します。");
+  console.log("--rhythm-onlyも対応する音源をffmpegで解析し、TJA譜面と対応づけた配置統計を作成します。");
+  console.log("音源はローカルで処理し、学習結果はデータフォルダー内に保存します。");
 }

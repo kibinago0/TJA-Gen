@@ -227,6 +227,9 @@ function generateChart(audioBuffer, bpm, targetRate, measureResolution, course, 
   const measureDuration = 240 / bpm;
   const measureCount = Math.max(1, Math.ceil(audioBuffer.duration / measureDuration));
   const minimumGap = Math.max(1, Math.ceil(measureResolution / 48));
+  const measureActivities = Array.from({ length: measureCount }, (_, measureIndex) => (
+    measureAudioActivity(envelope, measureIndex * measureDuration, measureDuration)
+  ));
   const candidateGroups = [];
   for (let measureIndex = 0; measureIndex < measureCount; measureIndex += 1) {
     const measureStart = measureIndex * measureDuration;
@@ -237,7 +240,16 @@ function generateChart(audioBuffer, bpm, targetRate, measureResolution, course, 
       const activity = audioActivity(envelope, time);
       if (!activity.active) continue;
       const candidate = algorithm === "learned"
-        ? scoreWithModel(model, envelope, time, slot, measureResolution, bpm, level, courseIndex, course)
+        ? scoreWithModel(
+          model,
+          envelope,
+          time,
+          slot,
+          measureResolution,
+          bpm,
+          level,
+          courseIndex
+        )
         : scoreByAmplitude(envelope, time, slot, measureResolution);
       candidates.push({
         ...candidate,
@@ -253,7 +265,9 @@ function generateChart(audioBuffer, bpm, targetRate, measureResolution, course, 
   const measureNoteCounts = allocateMeasureNoteCounts(
     candidateGroups,
     Math.round(targetRate * envelope.duration),
-    minimumGap
+    minimumGap,
+    measureActivities,
+    model?.rhythm?.courses?.[course]
   );
   const measures = [];
   const measurePatterns = [];
@@ -278,6 +292,9 @@ function generateChart(audioBuffer, bpm, targetRate, measureResolution, course, 
         previousMeasureLastSlot
       );
     }
+    if (algorithm === "learned") {
+      applyLearnedBigNotes(selected, candidates, measureIndex, measureResolution, rhythmProfile, courseIndex);
+    }
     measurePatterns.push(new Set(selected.keys()));
     previousMeasureLastSlot = selected.size ? Math.max(...selected.keys()) : null;
     let row = "";
@@ -293,7 +310,7 @@ function generateChart(audioBuffer, bpm, targetRate, measureResolution, course, 
   return { measures, noteCount, actualRate: noteCount / audioBuffer.duration };
 }
 
-function allocateMeasureNoteCounts(candidateGroups, targetTotal, minimumGap) {
+function allocateMeasureNoteCounts(candidateGroups, targetTotal, minimumGap, measureActivities, profile) {
   const capacities = candidateGroups.map((candidates) => maxSeparatedNoteCount(candidates, minimumGap));
   const activities = candidateGroups.map((candidates) => {
     if (!candidates.length) return 0;
@@ -303,7 +320,10 @@ function allocateMeasureNoteCounts(candidateGroups, targetTotal, minimumGap) {
   const counts = new Array(candidateGroups.length).fill(0);
   let remaining = Math.min(totalCapacity, targetTotal);
   const maxActivity = Math.max(...activities, 1e-8);
-  const weights = activities.map((activity) => 0.65 + 0.7 * Math.sqrt(activity / maxActivity));
+  const weights = activities.map((activity, index) => (
+    (0.35 + 0.65 * Math.sqrt(activity / maxActivity))
+    * learnedMeasureDensityRatio(profile, measureActivities[index])
+  ));
 
   while (remaining > 0) {
     const active = capacities.map((capacity, index) => index).filter((index) => counts[index] < capacities[index]);
@@ -336,6 +356,34 @@ function allocateMeasureNoteCounts(candidateGroups, targetTotal, minimumGap) {
     }
   }
   return counts;
+}
+
+function measureAudioActivity(envelope, measureStart, measureDuration) {
+  let activity = 0;
+  const sampleCount = 16;
+  for (let index = 0; index < sampleCount; index += 1) {
+    const seconds = measureStart + measureDuration * (index + 0.5) / sampleCount;
+    activity += audioActivity(envelope, seconds).score;
+  }
+  return activity / sampleCount;
+}
+
+function learnedMeasureDensityRatio(profile, activity) {
+  const density = profile?.jointMeasureDensity;
+  if (!Array.isArray(density?.sampleCounts) || density.sampleCounts.length !== 16
+    || !Array.isArray(density.densityRatioSums) || density.densityRatioSums.length !== 16) return 1;
+
+  const center = Math.min(15, Math.floor(activity * 16));
+  let weightedCount = 0;
+  let weightedRatioSum = 0;
+  for (let bin = Math.max(0, center - 2); bin <= Math.min(15, center + 2); bin += 1) {
+    const weight = 1 / (1 + Math.abs(bin - center));
+    weightedCount += density.sampleCounts[bin] * weight;
+    weightedRatioSum += density.densityRatioSums[bin] * weight;
+  }
+  const priorMeasureCount = 4;
+  const ratio = (weightedRatioSum + priorMeasureCount) / (weightedCount + priorMeasureCount);
+  return Math.max(0.1, Math.min(3, ratio));
 }
 
 function maxSeparatedNoteCount(candidates, minimumGap) {
@@ -547,7 +595,7 @@ function scoreByAmplitude(envelope, seconds, slot, measureResolution) {
   return { score: peak, note: isKat ? 2 : 1 };
 }
 
-function scoreWithModel(model, envelope, seconds, slot, measureResolution, bpm, level, courseIndex, course) {
+function scoreWithModel(model, envelope, seconds, slot, measureResolution, bpm, level, courseIndex) {
   const features = makeHighResolutionFeatures(envelope, seconds, slot, measureResolution, bpm, level, courseIndex);
   const scores = [];
   for (let note = 0; note <= 4; note += 1) {
@@ -561,9 +609,6 @@ function scoreWithModel(model, envelope, seconds, slot, measureResolution, bpm, 
     }
     scores.push(score);
   }
-  const bigNoteBias = bigNotePhaseBias(model.rhythm?.courses?.[course], slot, measureResolution);
-  scores[3] += bigNoteBias;
-  scores[4] += bigNoteBias;
   let bestNote = 1;
   for (let note = 2; note <= 4; note += 1) {
     if (scores[note] > scores[bestNote]) bestNote = note;
@@ -574,25 +619,64 @@ function scoreWithModel(model, envelope, seconds, slot, measureResolution, bpm, 
   return { score: logSumExpNotes - scores[0], note: bestNote };
 }
 
-function bigNotePhaseBias(profile, slot, measureResolution) {
-  const bigCounts = profile?.bigNotePhaseCounts;
-  const regularCounts = profile?.regularNotePhaseCounts;
-  if (!Array.isArray(bigCounts) || bigCounts.length !== 16
-    || !Array.isArray(regularCounts) || regularCounts.length !== 16) return 0;
+function applyLearnedBigNotes(selected, candidates, measureIndex, measureResolution, profile, courseIndex) {
+  const bigCounts = profile?.jointBigNoteCounts;
+  const regularCounts = profile?.jointRegularNoteCounts;
+  if (!Array.isArray(bigCounts) || bigCounts.length !== 256
+    || !Array.isArray(regularCounts) || regularCounts.length !== 256) return;
 
-  const phase = Math.min(15, Math.floor(slot / measureResolution * 16));
   const bigTotal = bigCounts.reduce((sum, value) => sum + value, 0);
   const regularTotal = regularCounts.reduce((sum, value) => sum + value, 0);
-  const phaseBig = bigCounts[phase];
-  const phaseRegular = regularCounts[phase];
-  const phaseTotal = phaseBig + phaseRegular;
-  const smoothing = 2;
-  const phaseLogOdds = Math.log((phaseBig + smoothing) / (phaseRegular + smoothing));
-  const overallLogOdds = Math.log(
-    (bigTotal + smoothing * 16) / (regularTotal + smoothing * 16)
-  );
-  const confidence = phaseTotal / (phaseTotal + 64);
-  return Math.max(-1, Math.min(1, (phaseLogOdds - overallLogOdds) * confidence));
+  if (bigTotal + regularTotal === 0) return;
+  const overallProbability = bigTotal / (bigTotal + regularTotal);
+  const candidateBySlot = new Map(candidates.map((candidate) => [candidate.slot, candidate]));
+  for (const [slot, note] of selected) {
+    const candidate = candidateBySlot.get(slot);
+    if (!candidate) continue;
+    const regularNote = note === 2 || note === 4 ? 2 : 1;
+    selected.set(slot, regularNote);
+    const probability = learnedBigNoteProbability(
+      bigCounts,
+      regularCounts,
+      overallProbability,
+      candidate.activity,
+      slot,
+      measureResolution
+    );
+    if (deterministicNoteRoll(measureIndex, slot, courseIndex) < probability) {
+      selected.set(slot, regularNote + 2);
+    }
+  }
+}
+
+function learnedBigNoteProbability(bigCounts, regularCounts, overallProbability, activity, slot, measureResolution) {
+  const activityBin = Math.min(15, Math.floor(activity * 16));
+  const phase = Math.min(15, Math.floor(slot / measureResolution * 16));
+  let localBig = 0;
+  let localRegular = 0;
+  for (let audioOffset = -1; audioOffset <= 1; audioOffset += 1) {
+    const audioBin = activityBin + audioOffset;
+    if (audioBin < 0 || audioBin > 15) continue;
+    const audioWeight = audioOffset === 0 ? 2 : 1;
+    for (let phaseOffset = -1; phaseOffset <= 1; phaseOffset += 1) {
+      const phaseBin = Math.max(0, Math.min(15, phase + phaseOffset));
+      const phaseWeight = phaseOffset === 0 ? 2 : 1;
+      const index = audioBin * 16 + phaseBin;
+      const weight = audioWeight * phaseWeight;
+      localBig += bigCounts[index] * weight;
+      localRegular += regularCounts[index] * weight;
+    }
+  }
+  const priorCount = 32;
+  return (localBig + priorCount * overallProbability) / (localBig + localRegular + priorCount);
+}
+
+function deterministicNoteRoll(measureIndex, slot, courseIndex) {
+  let hash = 2166136261;
+  for (const character of `${courseIndex}:${measureIndex}:${slot}`) {
+    hash = Math.imul(hash ^ character.charCodeAt(0), 16777619);
+  }
+  return (hash >>> 0) / 0x100000000;
 }
 
 function makeHighResolutionFeatures(envelope, seconds, slot, measureResolution, bpm, level, courseIndex) {

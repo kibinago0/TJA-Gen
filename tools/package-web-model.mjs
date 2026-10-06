@@ -73,25 +73,35 @@ try {
 }
 
 function validateRhythmProfile(profile) {
-  if (profile.formatVersion !== 1 || !profile.courses || typeof profile.courses !== "object") {
+  if (profile.formatVersion !== 2 || !profile.courses || typeof profile.courses !== "object") {
     throw new Error("リズム学習データの形式が不正です。");
   }
   for (const course of Object.values(profile.courses)) {
-    const hasBigNotePhases = course.bigNotePhaseCounts !== undefined
-      || course.regularNotePhaseCounts !== undefined;
     if (!Array.isArray(course.gapCounts) || course.gapCounts.length !== 513
       || !Array.isArray(course.phaseCounts) || course.phaseCounts.length !== 16
       || !Array.isArray(course.noteTransitions) || course.noteTransitions.length !== 25
-      || (hasBigNotePhases && (
-        !Array.isArray(course.bigNotePhaseCounts) || course.bigNotePhaseCounts.length !== 16
-        || !Array.isArray(course.regularNotePhaseCounts) || course.regularNotePhaseCounts.length !== 16
-        || !Number.isInteger(course.bigNoteCount) || course.bigNoteCount < 0
-        || !Number.isInteger(course.regularNoteCount) || course.regularNoteCount < 0
-      ))
+      || !Array.isArray(course.jointBigNoteCounts) || course.jointBigNoteCounts.length !== 256
+      || !Array.isArray(course.jointRegularNoteCounts) || course.jointRegularNoteCounts.length !== 256
+      || !Array.isArray(course.jointMeasureDensity?.sampleCounts)
+      || course.jointMeasureDensity.sampleCounts.length !== 16
+      || !Array.isArray(course.jointMeasureDensity?.densityRatioSums)
+      || course.jointMeasureDensity.densityRatioSums.length !== 16
+      || !Number.isInteger(course.jointChartCount) || course.jointChartCount < 0
+      || !Number.isInteger(course.jointMeasureCount) || course.jointMeasureCount < 0
+      || !Number.isInteger(course.bigNoteCount) || course.bigNoteCount < 0
+      || !Number.isInteger(course.regularNoteCount) || course.regularNoteCount < 0
       || [...course.gapCounts, ...course.phaseCounts, ...course.noteTransitions]
-        .concat(course.bigNotePhaseCounts ?? [], course.regularNotePhaseCounts ?? [])
         .some((count) => !Number.isInteger(count) || count < 0)) {
       throw new Error("リズム学習データの統計値が不正です。");
+    }
+    const integerCounts = [
+      ...course.jointBigNoteCounts,
+      ...course.jointRegularNoteCounts,
+      ...course.jointMeasureDensity.sampleCounts
+    ];
+    if (integerCounts.some((count) => !Number.isInteger(count) || count < 0)
+      || course.jointMeasureDensity.densityRatioSums.some((value) => !Number.isFinite(value) || value < 0)) {
+      throw new Error("音源と譜面の対応統計値が不正です。");
     }
   }
 }
