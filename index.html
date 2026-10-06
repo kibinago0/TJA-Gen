@@ -20,18 +20,13 @@
       </header>
 
       <section class="hero" aria-labelledby="page-title">
-        <p class="eyebrow">譜面づくりを、もっと自由に。</p>
-        <h1 id="page-title">音源から、<span>譜面をつくる。</span></h1>
-        <p class="hero-copy">曲と設定を選ぶだけ。ブラウザーで音の強弱を解析して、TJAファイルを生成します。</p>
+        <p class="eyebrow">音源からTJAを作る</p>
+        <h1 id="page-title">シンプルに<span>譜面生成</span></h1>
       </section>
 
       <section class="generator-card" aria-labelledby="generator-title">
         <div class="card-heading">
-          <div>
-            <p class="section-kicker">CHART GENERATOR</p>
-            <h2 id="generator-title">譜面の設定</h2>
-          </div>
-          <span class="step-badge">01 <span>/ 02</span></span>
+          <h2 id="generator-title">譜面設定</h2>
         </div>
 
         <form id="generator-form">
@@ -98,7 +93,7 @@
 
           <div class="algorithm-note">
             <span aria-hidden="true">✳</span>
-            <p><strong>音源と譜面を一緒に学習</strong>　学習方式では音の特徴に対して譜面が詰まる／空く位置や、大音符の配置を学びます。無音部分を避け、最低48分音符相当の間隔を保ちます。</p>
+            <p><strong>学習モード</strong>　音の強弱を見て自然な間隔で配置します。</p>
           </div>
 
           <button class="generate-button" id="generate-button" type="submit">
@@ -111,10 +106,7 @@
 
       <section class="result-card" id="result-card" aria-live="polite" hidden>
         <div class="result-heading">
-          <div>
-            <p class="section-kicker">READY TO EXPORT</p>
-            <h2>譜面ができました</h2>
-          </div>
+          <h2>生成完了</h2>
           <span class="result-check" aria-hidden="true">✓</span>
         </div>
         <div class="result-stats">
