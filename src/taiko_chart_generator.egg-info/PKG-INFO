@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: taiko-chart-generator
+Version: 0.1.0
+Summary: Audio-driven Taiko chart generation with PPO
+Requires-Python: >=3.10
+Requires-Dist: numpy>=1.24
+Requires-Dist: soundfile>=0.12
+Requires-Dist: torch>=2.2
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
