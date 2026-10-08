@@ -164,6 +164,7 @@ python generate.py <音源ファイル> [オプション]
 | `--bpm` | BPMを手動指定 | 音源から推定 |
 | `--offset` | OFFSETを手動指定 | `0.0` |
 | `--max-seconds` | 解析・生成に使う音源の最大秒数 | 音源全体 |
+| `--seed` | 人間譜面パターンの抽選に使う乱数シード | `7` |
 | `--maximum-density` | ノーツ密度の上限（ノーツ／秒） | 上限なし |
 | `--device` | PyTorchの実行デバイス | `cpu` |
 

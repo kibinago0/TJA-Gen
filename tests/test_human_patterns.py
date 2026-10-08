@@ -1,3 +1,6 @@
+import random
+from collections import Counter
+
 import pytest
 
 from taiko_ai.agent.ppo_agent import PPOAgent
@@ -29,6 +32,49 @@ def test_human_pattern_model_rewards_common_and_penalizes_unseen_patterns() -> N
     assert model.score([Action.DON], Action.DON) == 5.0
     assert model.score([Action.DON], Action.KA) == -5.0
     assert model.score([Action.REST], Action.DON) == 0.0
+
+
+def test_pattern_frequency_guides_reward_and_note_sampling() -> None:
+    model = HumanPatternModel(counts=Counter({"DD": 90, "DK": 10}))
+
+    probabilities = model.next_symbol_probabilities([Action.DON])
+    sampled = [
+        model.sample_action(Action.DON, [Action.DON], random.Random(seed))
+        for seed in range(1000)
+    ]
+
+    assert probabilities[0] > probabilities[1]
+    assert model.score([Action.DON], Action.DON) == 5.0
+    assert model.score([Action.DON], Action.KA) == -5.0
+    assert 850 < sampled.count(Action.DON) < 950
+    assert 50 < sampled.count(Action.KA) < 150
+
+
+def test_pattern_sampling_preserves_big_notes_and_other_actions() -> None:
+    model = HumanPatternModel(counts=Counter({"DD": 90, "DK": 10}))
+
+    assert (
+        model.sample_action(
+            Action.BIG_DON,
+            [Action.DON],
+            random.Random(7),
+        )
+        == Action.BIG_DON
+    )
+    assert (
+        model.sample_action(Action.ROLL_START, [], random.Random(7))
+        == Action.ROLL_START
+    )
+
+
+def test_pattern_sampling_without_chart_data_keeps_the_policy_action() -> None:
+    action = HumanPatternModel().sample_action(
+        Action.DON,
+        [Action.DON],
+        random.Random(7),
+    )
+
+    assert action == Action.DON
 
 
 def test_pattern_model_round_trips_and_rejects_invalid_counts() -> None:

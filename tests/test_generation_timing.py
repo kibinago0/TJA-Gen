@@ -65,6 +65,13 @@ def test_cli_accepts_case_insensitive_difficulty_names() -> None:
     assert arguments.difficulty == "Oni"
 
 
+def test_generation_pattern_seed_is_reproducible_by_default_and_overridable() -> None:
+    parser = build_parser()
+
+    assert parser.parse_args(["song.wav"]).seed == 7
+    assert parser.parse_args(["song.wav", "--seed", "42"]).seed == 42
+
+
 @pytest.mark.parametrize(
     ("option", "value"),
     [

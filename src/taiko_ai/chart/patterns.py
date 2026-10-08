@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -34,6 +35,18 @@ class HumanPatternModel:
         if symbol is None or not self.counts:
             return 0.0
 
+        probabilities = self.next_symbol_probabilities(history)
+        probability = probabilities[0] if symbol == "D" else probabilities[1]
+        if probability >= 0.8:
+            return 5.0
+        if probability <= 0.2:
+            return -5.0
+        return 10.0 * (probability - 0.5)
+
+    def next_symbol_probabilities(
+        self,
+        history: Iterable[int],
+    ) -> tuple[float, float]:
         previous_symbols = [
             history_symbol
             for item in history
@@ -49,14 +62,50 @@ class HumanPatternModel:
             context_count = drum_count + ka_count
             if context_count < 10:
                 continue
-            count = drum_count if symbol == "D" else ka_count
-            probability = (count + 1.0) / (context_count + 2.0)
-            if count >= 10 and probability >= 0.2:
-                return 5.0
-            if count >= 3 and probability >= 0.05:
-                return 2.0
-            return -5.0
-        return 0.0
+            denominator = context_count + 2.0
+            return (
+                (drum_count + 1.0) / denominator,
+                (ka_count + 1.0) / denominator,
+            )
+
+        drum_count = sum(
+            count
+            for pattern, count in self.counts.items()
+            if len(pattern) == 2 and pattern[-1] == "D"
+        )
+        ka_count = sum(
+            count
+            for pattern, count in self.counts.items()
+            if len(pattern) == 2 and pattern[-1] == "K"
+        )
+        context_count = drum_count + ka_count
+        if context_count == 0:
+            return 0.5, 0.5
+        denominator = context_count + 2.0
+        return (
+            (drum_count + 1.0) / denominator,
+            (ka_count + 1.0) / denominator,
+        )
+
+    def sample_action(
+        self,
+        action: int,
+        history: Iterable[int],
+        rng: random.Random,
+    ) -> int:
+        if action not in (
+            Action.DON,
+            Action.KA,
+            Action.BIG_DON,
+            Action.BIG_KA,
+        ) or not self.counts:
+            return int(action)
+
+        drum_probability, _ = self.next_symbol_probabilities(history)
+        is_big = action in (Action.BIG_DON, Action.BIG_KA)
+        if rng.random() < drum_probability:
+            return int(Action.BIG_DON if is_big else Action.DON)
+        return int(Action.BIG_KA if is_big else Action.KA)
 
     def to_dict(self) -> dict[str, int | dict[str, int]]:
         return {

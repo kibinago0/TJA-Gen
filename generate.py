@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import random
 import tempfile
 from pathlib import Path
 
@@ -152,6 +153,7 @@ def generate(args: argparse.Namespace) -> Path:
         difficulty=args.level,
         pattern_model=pattern_model,
     )
+    rng = random.Random(args.seed)
     observation = env.reset()
     notes: list[ChartNote] = []
     last_note_time: float | None = None
@@ -162,6 +164,12 @@ def generate(args: argparse.Namespace) -> Path:
             action = int(Action.REST)
         else:
             action = limit_note_density(action, time, last_note_time, args.level)
+            if pattern_model is not None:
+                action = pattern_model.sample_action(
+                    action,
+                    env.note_history,
+                    rng,
+                )
         observation, _, done, info = env.step(action)
         note_value = _tja_note_value(action)
         if note_value is not None:
@@ -251,6 +259,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="override OFFSET (defaults to 0.0; audio starts at time zero)",
     )
     parser.add_argument("--max-seconds", type=_parse_positive_finite)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=7,
+        help="seed for reproducible sampling of human note patterns",
+    )
     parser.add_argument(
         "--maximum-density",
         type=_parse_positive_finite,
