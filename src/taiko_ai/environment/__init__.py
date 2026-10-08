@@ -1,2 +1,0 @@
-"""Taiko note-generation environment."""
-
